@@ -86,12 +86,12 @@ pub const Qwen3ForCausalLM = struct {
         return self.lm_head.forward(hidden_states);
     }
 
-    pub fn forwardHidden(self: Qwen3ForCausalLM, input_ids: zml.Tensor) zml.Tensor {
-        return self.model.forward(input_ids, null, null);
+    pub fn forwardHidden(self: Qwen3ForCausalLM, input_ids: zml.Tensor, attention_mask: ?zml.Tensor) zml.Tensor {
+        return self.model.forward(input_ids, attention_mask, null);
     }
 
-    pub fn encodePrompt(self: Qwen3ForCausalLM, input_ids: zml.Tensor) zml.Tensor {
-        return self.forwardHidden(input_ids).squeeze(.b).convert(.f32);
+    pub fn encodePrompt(self: Qwen3ForCausalLM, input_ids: zml.Tensor, attention_mask: zml.Tensor) zml.Tensor {
+        return self.model.forwardPreNorm(input_ids, attention_mask, null).squeeze(.b).convert(.f32);
     }
 };
 
@@ -158,6 +158,15 @@ pub const Qwen3Model = struct {
         attention_mask: ?zml.Tensor,
         position_ids: ?zml.Tensor,
     ) zml.Tensor {
+        return self.norm.forward(self.forwardPreNorm(input_ids, attention_mask, position_ids));
+    }
+
+    pub fn forwardPreNorm(
+        self: Qwen3Model,
+        input_ids: zml.Tensor,
+        attention_mask: ?zml.Tensor,
+        position_ids: ?zml.Tensor,
+    ) zml.Tensor {
         var hidden_states = self.embed_tokens.weight.gather(.{ .voc = input_ids }, .{});
         const resolved_position_ids = position_ids orelse zml.Tensor.arange(.{ .end = hidden_states.dim(.s) }, .i64)
             .withTags(.{.s})
@@ -173,7 +182,7 @@ pub const Qwen3Model = struct {
             );
         }
 
-        return self.norm.forward(hidden_states);
+        return hidden_states;
     }
 };
 
@@ -422,16 +431,27 @@ pub const Qwen3Attention = struct {
         key_states = key_states.splitAxis(.dout, .{ .hk = self.config.num_key_value_heads, .hd = self.head_dim });
         value_states = value_states.splitAxis(.dout, .{ .hk = self.config.num_key_value_heads, .hd = self.head_dim });
 
-        query_states = self.q_norm.forward(query_states);
-        key_states = self.k_norm.forward(key_states);
+        query_states = self.q_norm.forward(query_states.rename(.{ .hd = .d })).rename(.{ .d = .hd });
+        key_states = self.k_norm.forward(key_states.rename(.{ .hd = .d })).rename(.{ .d = .hd });
 
         query_states, key_states = applyRotaryPosEmb(query_states, key_states, cos, sin);
 
         const q = query_states.rename(.{ .s = .q });
         const k = repeatKv(key_states, self.num_key_value_groups).rename(.{ .s = .k });
         const v = repeatKv(value_states, self.num_key_value_groups).rename(.{ .s = .k });
+        var attn_mask = zml.nn.causalAttnMask(.{ .q = q.dim(.q), .k = k.dim(.k) }, q.dtype(), self.sliding_window);
+        if (attention_mask) |mask| {
+            const key_mask = mask.squeeze(.b)
+                .rename(.{ .s = .k })
+                .insertAxes(.k, .{.q})
+                .broad(zml.Shape.init(.{ .q = q.dim(.q), .k = k.dim(.k) }, .bool));
+            const zeros = zml.Tensor.constant(q.dtype().zero()).broad(key_mask.shape());
+            const minus_inf = zml.Tensor.constant(q.dtype().minValue()).broad(key_mask.shape());
+            const padding_mask = zml.Tensor.select(key_mask, zeros, minus_inf);
+            attn_mask = attn_mask.add(padding_mask);
+        }
         const attn_output = zml.nn.sdpa(q.squeeze(.b), k.squeeze(.b), v.squeeze(.b), .{
-            .attn_mask = if (attention_mask) |mask| mask.squeeze(.b) else null,
+            .attn_mask = attn_mask,
             .scale = zml.Tensor.scalar(self.scaling, .f32),
         })
             .insertAxes(.q, .{.b})
@@ -447,11 +467,13 @@ pub const Qwen3Attention = struct {
         cos: zml.Tensor,
         sin: zml.Tensor,
     ) struct { zml.Tensor, zml.Tensor } {
-        const cos_expanded = cos.insertAxes(.hd, .{.h}).broad(q.shape());
-        const sin_expanded = sin.insertAxes(.hd, .{.h}).broad(q.shape());
+        const q_cos = cos.insertAxes(.hd, .{.h}).broad(q.shape());
+        const q_sin = sin.insertAxes(.hd, .{.h}).broad(q.shape());
+        const k_cos = cos.insertAxes(.hd, .{.hk}).broad(k.shape());
+        const k_sin = sin.insertAxes(.hd, .{.hk}).broad(k.shape());
 
-        const q_embed = q.mul(cos_expanded).add(rotateHalf(q).mul(sin_expanded));
-        const k_embed = k.mul(cos_expanded).add(rotateHalf(k).mul(sin_expanded));
+        const q_embed = q.mul(q_cos).add(rotateHalf(q).mul(q_sin));
+        const k_embed = k.mul(k_cos).add(rotateHalf(k).mul(k_sin));
 
         return .{ q_embed, k_embed };
     }
@@ -472,12 +494,12 @@ pub const Qwen3Attention = struct {
 
         const with_group = hidden_states.insertAxes(.hk, .{.g}).broad(zml.Shape.init(.{
             .b = hidden_states.dim(.b),
-            .hk = hidden_states.dim(.hk),
-            .g = n_rep,
             .s = hidden_states.dim(.s),
+            .g = n_rep,
+            .hk = hidden_states.dim(.hk),
             .hd = hidden_states.dim(.hd),
         }, hidden_states.dtype()));
-        return with_group.merge(.{ .h = .{ .hk, .g } });
+        return with_group.merge(.{ .h = .{ .g, .hk } });
     }
 };
 

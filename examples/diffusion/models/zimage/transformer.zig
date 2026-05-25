@@ -60,15 +60,26 @@ pub const Transformer = struct {
     rope_embedder: RopeEmbedder,
 
     pub fn init(
+        self: *Transformer,
         allocator: std.mem.Allocator,
         store: zml.io.TensorStore.View,
         config: Config,
-    ) !Transformer {
+    ) !void {
         std.debug.assert(config.all_patch_size.len == config.all_f_patch_size.len);
         std.debug.assert(@divExact(config.dim, config.n_heads) == config.axes_dims[0] + config.axes_dims[1] + config.axes_dims[2]);
 
-        var all_x_embedder: [1]zml.nn.Linear = undefined;
-        var all_final_layer: [1]FinalLayer = undefined;
+        self.in_channels = config.in_channels;
+        self.out_channels = config.in_channels;
+        self.all_patch_size = config.all_patch_size;
+        self.all_f_patch_size = config.all_f_patch_size;
+        self.dim = config.dim;
+        self.n_heads = config.n_heads;
+        self.rope_theta = config.rope_theta;
+        self.t_scale = config.t_scale;
+        self.gradient_checkpointing = false;
+        self.axes_dims = config.axes_dims;
+        self.axes_lens = config.axes_lens;
+        self.rope_embedder = RopeEmbedder.init(config.rope_theta, config.axes_dims, config.axes_lens);
 
         for (config.all_patch_size, config.all_f_patch_size, 0..) |patch_size, f_patch_size, i| {
             var key_buffer: [32]u8 = undefined;
@@ -76,7 +87,7 @@ pub const Transformer = struct {
             const inner_dim = f_patch_size * patch_size * patch_size * config.in_channels;
             const final_dim = patch_size * patch_size * f_patch_size * config.in_channels;
 
-            all_x_embedder[i] = .init(
+            self.all_x_embedder[i] = .init(
                 store.withPrefix("all_x_embedder").withPrefix(key).createTensor("weight", .{ .dout, .d }, .{
                     .dout = .model,
                     .d = .replicated,
@@ -87,9 +98,8 @@ pub const Transformer = struct {
                 .d,
             );
 
-            all_final_layer[i] = try FinalLayer.init(
+            self.all_final_layer[i] = try FinalLayer.init(
                 store.withPrefix("all_final_layer").withPrefix(key),
-                config.dim,
                 final_dim,
             );
 
@@ -101,8 +111,7 @@ pub const Transformer = struct {
         std.debug.assert(config.n_refiner_layers == NumRefinerLayers);
         std.debug.assert(config.n_layers == NumLayers);
 
-        var noise_refiner: [NumRefinerLayers]ZImageTransformerBlock = undefined;
-        for (&noise_refiner, 0..) |*layer, i| {
+        for (&self.noise_refiner, 0..) |*layer, i| {
             layer.* = try ZImageTransformerBlock.init(
                 store.withPrefix("noise_refiner").withLayer(i),
                 1000 + @as(u32, @intCast(i)),
@@ -115,8 +124,7 @@ pub const Transformer = struct {
             );
         }
 
-        var context_refiner: [NumRefinerLayers]ZImageTransformerBlock = undefined;
-        for (&context_refiner, 0..) |*layer, i| {
+        for (&self.context_refiner, 0..) |*layer, i| {
             layer.* = try ZImageTransformerBlock.init(
                 store.withPrefix("context_refiner").withLayer(i),
                 @intCast(i),
@@ -129,8 +137,7 @@ pub const Transformer = struct {
             );
         }
 
-        var layers: [NumLayers]ZImageTransformerBlock = undefined;
-        for (&layers, 0..) |*layer, i| {
+        for (&self.layers, 0..) |*layer, i| {
             layer.* = try ZImageTransformerBlock.init(
                 store.withPrefix("layers").withLayer(i),
                 @intCast(i),
@@ -143,11 +150,11 @@ pub const Transformer = struct {
             );
         }
 
-        var siglip_embedder: ?Embedder = null;
-        var siglip_refiner: ?[NumRefinerLayers]ZImageTransformerBlock = null;
-        var siglip_pad_token: ?zml.Tensor = null;
+        self.siglip_embedder = null;
+        self.siglip_refiner = null;
+        self.siglip_pad_token = null;
         if (config.siglip_feat_dim) |siglip_feat_dim| {
-            siglip_embedder = try Embedder.init(
+            self.siglip_embedder = try Embedder.init(
                 store.withPrefix("siglip_embedder"),
                 config.norm_eps,
             );
@@ -166,45 +173,23 @@ pub const Transformer = struct {
                     false,
                 );
             }
-            siglip_refiner = refiner;
-            siglip_pad_token = store.withPrefix("siglip_pad_token").createTensor("weight", .{ .tok, .d }, .{
+            self.siglip_refiner = refiner;
+            self.siglip_pad_token = store.createTensor("siglip_pad_token", .{ .tok, .d }, .{
                 .tok = .replicated,
                 .d = .replicated,
             });
         }
 
-        return .{
-            .in_channels = config.in_channels,
-            .out_channels = config.in_channels,
-            .all_patch_size = config.all_patch_size,
-            .all_f_patch_size = config.all_f_patch_size,
-            .dim = config.dim,
-            .n_heads = config.n_heads,
-            .rope_theta = config.rope_theta,
-            .t_scale = config.t_scale,
-            .gradient_checkpointing = false,
-            .all_x_embedder = all_x_embedder,
-            .all_final_layer = all_final_layer,
-            .noise_refiner = noise_refiner,
-            .context_refiner = context_refiner,
-            .t_embedder = try TimestepEmbedder.init(store.withPrefix("t_embedder"), @min(config.dim, ADALN_EMBED_DIM), 1024),
-            .cap_embedder = try Embedder.init(store.withPrefix("cap_embedder"), config.norm_eps),
-            .siglip_embedder = siglip_embedder,
-            .siglip_refiner = siglip_refiner,
-            .siglip_pad_token = siglip_pad_token,
-            .x_pad_token = store.withPrefix("x_pad_token").createTensor("weight", .{ .tok, .d }, .{
-                .tok = .replicated,
-                .d = .replicated,
-            }),
-            .cap_pad_token = store.withPrefix("cap_pad_token").createTensor("weight", .{ .tok, .d }, .{
-                .tok = .replicated,
-                .d = .replicated,
-            }),
-            .layers = layers,
-            .axes_dims = config.axes_dims,
-            .axes_lens = config.axes_lens,
-            .rope_embedder = RopeEmbedder.init(config.rope_theta, config.axes_dims, config.axes_lens),
-        };
+        self.t_embedder = try TimestepEmbedder.init(store.withPrefix("t_embedder"), @min(config.dim, ADALN_EMBED_DIM), 1024);
+        self.cap_embedder = try Embedder.init(store.withPrefix("cap_embedder"), config.norm_eps);
+        self.x_pad_token = store.createTensor("x_pad_token", .{ .tok, .d }, .{
+            .tok = .replicated,
+            .d = .replicated,
+        });
+        self.cap_pad_token = store.createTensor("cap_pad_token", .{ .tok, .d }, .{
+            .tok = .replicated,
+            .d = .replicated,
+        });
     }
 
     pub fn deinit(self: Transformer, allocator: std.mem.Allocator) void {
@@ -233,7 +218,7 @@ pub const Transformer = struct {
     }
 
     pub fn forward(
-        self: Transformer,
+        self: *const Transformer,
         image: zml.Tensor,
         t: zml.Tensor,
         cap_feat: zml.Tensor,
@@ -242,7 +227,6 @@ pub const Transformer = struct {
     ) zml.Tensor {
         std.debug.assert(patch_size == self.all_patch_size[0]);
         std.debug.assert(f_patch_size == self.all_f_patch_size[0]);
-
         const size = ImageSize{
             .f = @intCast(image.dim(.f)),
             .h = @intCast(image.dim(.h)),
@@ -250,7 +234,7 @@ pub const Transformer = struct {
         };
 
         const timestep_embed = self.t_embedder.forward(t.convert(.f32).scale(self.t_scale)).squeeze(.b);
-        const x_patches = patchifyImage(image, patch_size, f_patch_size);
+        const x_patches = patchifyImage(image, patch_size, f_patch_size).convert(self.all_x_embedder[0].weight.dtype());
         const x_pos_ids = createCoordinateGrid(
             .{
                 @divExact(size.f, f_patch_size),
@@ -259,14 +243,14 @@ pub const Transformer = struct {
             },
             .{ 0, 0, 0 },
         );
-        var x_hidden = self.all_x_embedder[0].forward(x_patches);
+        var x_hidden = self.all_x_embedder[0].forward(x_patches).rename(.{ .dout = .d });
         const x_freqs = self.rope_embedder.forward(x_pos_ids);
 
         for (self.noise_refiner) |layer| {
             x_hidden = layer.forward(x_hidden, null, x_freqs, timestep_embed, null, null, null);
         }
 
-        var cap_hidden = self.cap_embedder.forward(cap_feat);
+        var cap_hidden = self.cap_embedder.forward(cap_feat).rename(.{ .dout = .d });
         const cap_len: u32 = @intCast(cap_hidden.dim(.s));
         const cap_pos_ids = createCoordinateGrid(.{ cap_len, 1, 1 }, .{ 1, 0, 0 });
         const cap_freqs = self.rope_embedder.forward(cap_pos_ids);
@@ -285,6 +269,16 @@ pub const Transformer = struct {
         unified = self.all_final_layer[0].forward(unified, timestep_embed, null, null, null);
         const image_tokens = unified.slice1d(.s, .{ .end = x_patches.dim(.s) });
         return unpatchifyOne(image_tokens, size, patch_size, f_patch_size, self.out_channels);
+    }
+
+    pub fn denoiseStep(self: *const Transformer, latent: zml.Tensor, timestep: zml.Tensor, prompt_embeds: zml.Tensor) zml.Tensor {
+        return self.forward(
+            latent,
+            timestep,
+            prompt_embeds,
+            self.all_patch_size[0],
+            self.all_f_patch_size[0],
+        );
     }
 };
 
@@ -332,7 +326,10 @@ pub const TimestepEmbedder = struct {
             .withTags(.{.f})
             .scale(-std.math.log(f32, std.math.e, max_period) / @as(f32, @floatFromInt(half)))
             .exp();
-        const args = t.convert(.f32).insertAxes(.b, .{.f}).mul(freqs.insertAxes(.f, .{.b}));
+        const shape = zml.Shape.init(.{ .b = t.dim(.b), .f = half }, .f32);
+        const t_expanded = t.convert(.f32).insertAxes(.b, .{.f}).broad(shape);
+        const freqs_expanded = freqs.insertAxes(.f, .{.b}).broad(shape);
+        const args = t_expanded.mul(freqs_expanded);
         var embedding = zml.Tensor.concatenate(&.{ args.cos(), args.sin() }, -1);
         if (@mod(dim, 2) != 0) {
             const zero = zml.Tensor.constant(.{ .f32 = 0 }).broad(zml.Shape.init(.{ .b = t.dim(.b), .pad = 1 }, .f32));
@@ -342,8 +339,11 @@ pub const TimestepEmbedder = struct {
     }
 
     pub fn forward(self: TimestepEmbedder, t: zml.Tensor) zml.Tensor {
-        const t_freq = timestepEmbedding(t, self.frequency_embedding_size, 10000);
-        return self.mlp_2.forward(self.mlp_1.forward(t_freq).silu());
+        const t_freq = timestepEmbedding(t, self.frequency_embedding_size, 10000)
+            .rename(.{ .f = .d })
+            .convert(self.mlp_1.weight.dtype());
+        const hidden = self.mlp_1.forward(t_freq).rename(.{ .dout = .d }).silu();
+        return self.mlp_2.forward(hidden).rename(.{ .dout = .d });
     }
 };
 
@@ -374,7 +374,7 @@ pub const Embedder = struct {
     }
 
     pub fn forward(self: Embedder, x: zml.Tensor) zml.Tensor {
-        return self.linear.forward(self.norm.forward(x));
+        return self.linear.forward(self.norm.forward(x).convert(self.linear.weight.dtype()));
     }
 };
 
@@ -409,33 +409,34 @@ pub const RMSNorm = struct {
 
     pub fn forward(self: RMSNorm, hidden_states: zml.Tensor) zml.Tensor {
         const input_dtype = hidden_states.dtype();
-        var out = zml.nn.rmsNorm(hidden_states, .d, self.eps);
+        const hidden_f32 = hidden_states.convert(.f32);
+        var out = zml.nn.rmsNorm(hidden_f32, .d, self.eps);
 
         if (self.weight) |weight| {
-            out = out.mul(weight.broadcast(out.shape(), &.{out.axis(-1)}));
+            out = out.mul(weight.convert(.f32).broadcast(out.shape(), &.{out.axis(-1)}));
         } else {
             out = out.convert(input_dtype);
         }
 
         if (self.bias) |bias| {
-            out = out.add(bias.broadcast(out.shape(), &.{out.axis(-1)}));
+            out = out.add(bias.convert(.f32).broadcast(out.shape(), &.{out.axis(-1)}));
         }
 
-        return out;
+        return out.convert(input_dtype);
     }
 };
 
 pub const FinalLayer = struct {
-    norm_final: zml.nn.LayerNorm,
+    norm_final: OptionalLayerNorm,
     linear: zml.nn.Linear,
     adaLN_modulation: zml.nn.Linear,
 
-    pub fn init(store: zml.io.TensorStore.View, hidden_size: u32, out_channels: u32) !FinalLayer {
+    pub fn init(store: zml.io.TensorStore.View, out_channels: u32) !FinalLayer {
         _ = out_channels;
         return .{
             .norm_final = .{
-                .weight = zml.Tensor.constant(.{ .f32 = 1 }).broad(zml.Shape.init(.{ .d = hidden_size }, .f32)),
-                .bias = null,
+                .weight = store.withPrefix("norm_final").maybeCreateTensor("weight", .{.d}, .replicated),
+                .bias = store.withPrefix("norm_final").maybeCreateTensor("bias", .{.d}, .replicated),
                 .eps = 1e-6,
             },
             .linear = .init(
@@ -460,8 +461,7 @@ pub const FinalLayer = struct {
     }
 
     pub fn unloadBuffers(self: *zml.Bufferized(FinalLayer)) void {
-        self.norm_final.weight.deinit();
-        if (self.norm_final.bias) |*b| b.deinit();
+        OptionalLayerNorm.unloadBuffers(&self.norm_final);
         self.linear.weight.deinit();
         if (self.linear.bias) |*b| b.deinit();
         self.adaLN_modulation.weight.deinit();
@@ -479,16 +479,36 @@ pub const FinalLayer = struct {
         const seq_len = x.dim(.s);
 
         const scale = if (noise_mask) |mask| blk: {
-            const scale_noisy = self.adaLN_modulation.forward((c_noisy orelse @panic("missing c_noisy")).silu()).addConstant(1.0);
-            const scale_clean = self.adaLN_modulation.forward((c_clean orelse @panic("missing c_clean")).silu()).addConstant(1.0);
+            const scale_noisy = self.adaLN_modulation.forward((c_noisy orelse @panic("missing c_noisy")).silu()).rename(.{ .dout = .d }).addConstant(1.0);
+            const scale_clean = self.adaLN_modulation.forward((c_clean orelse @panic("missing c_clean")).silu()).rename(.{ .dout = .d }).addConstant(1.0);
             break :blk selectPerToken(scale_noisy, scale_clean, mask, @intCast(seq_len));
         } else blk: {
-            const global = self.adaLN_modulation.forward((c orelse @panic("missing c")).silu()).addConstant(1.0);
+            const global = self.adaLN_modulation.forward((c orelse @panic("missing c")).silu()).rename(.{ .dout = .d }).addConstant(1.0);
             break :blk global.insertAxes(.d, .{.s});
         };
 
         const normed = self.norm_final.forward(x).mul(scale);
-        return self.linear.forward(normed);
+        return self.linear.forward(normed).rename(.{ .dout = .d });
+    }
+};
+
+const OptionalLayerNorm = struct {
+    weight: ?zml.Tensor,
+    bias: ?zml.Tensor = null,
+    eps: f32 = 1e-5,
+
+    pub fn unloadBuffers(self: *zml.Bufferized(OptionalLayerNorm)) void {
+        if (self.weight) |*weight| weight.deinit();
+        if (self.bias) |*bias| bias.deinit();
+    }
+
+    pub fn forward(self: OptionalLayerNorm, x: zml.Tensor) zml.Tensor {
+        const normed = zml.nn.normalizeVariance(x, self.eps);
+        const ax = x.axis(-1);
+        var out = normed;
+        if (self.weight) |weight| out = out.mul(weight.broadcast(x.shape(), &.{ax}));
+        if (self.bias) |bias| out = out.add(bias.broadcast(x.shape(), &.{ax}));
+        return out;
     }
 };
 
@@ -553,14 +573,15 @@ pub const RopeEmbedder = struct {
 
         var result: [3]zml.Tensor = undefined;
         inline for (0..3) |i| {
-            const axis_ids = ids.slice1d(-1, .single(i)).squeeze(-1);
+            const axis_ids = ids.slice1d(-1, .single(i));
             const half = @divFloor(self.axes_dims[i], 2);
             const freqs = zml.Tensor.arange(.{ .end = half }, .f32)
                 .withTags(.{.hd})
                 .scale(-std.math.log(f32, std.math.e, self.theta) / @as(f32, @floatFromInt(self.axes_dims[i])))
                 .exp();
             const args = axis_ids.convert(.f32).outer(freqs);
-            result[i] = zml.Tensor.concatenate(&.{ args.cos(), args.sin() }, -1);
+            const emb = zml.Tensor.concatenate(&.{ args, args }, -1);
+            result[i] = zml.Tensor.concatenate(&.{ emb.cos(), emb.sin() }, -1);
         }
 
         return zml.Tensor.concatenate(&result, -1);
@@ -701,8 +722,8 @@ pub const ZSingleStreamAttention = struct {
 
     fn applyFreqs(x: zml.Tensor, freqs_cis: zml.Tensor, seq_tag: zml.Shape.Tag) zml.Tensor {
         const half_dim = @divExact(freqs_cis.dim(-1), 2);
-        const cos = freqs_cis.slice1d(-1, .{ .start = 0, .end = half_dim }).rename(.{ .s = seq_tag });
-        const sin = freqs_cis.slice1d(-1, .{ .start = half_dim, .end = freqs_cis.dim(-1) }).rename(.{ .s = seq_tag });
+        const cos = freqs_cis.slice1d(-1, .{ .start = 0, .end = half_dim }).rename(.{ .s = seq_tag }).convert(x.dtype());
+        const sin = freqs_cis.slice1d(-1, .{ .start = half_dim, .end = freqs_cis.dim(-1) }).rename(.{ .s = seq_tag }).convert(x.dtype());
         const cos_x = cos.insertAxes(.hd, .{.h}).broad(x.shape());
         const sin_x = sin.insertAxes(.hd, .{.h}).broad(x.shape());
         return x.mul(cos_x).add(rotateHalf(x).mul(sin_x));
@@ -731,7 +752,7 @@ pub const ZSingleStreamAttention = struct {
         const attn_out = zml.nn.sdpa(q, k, v, .{})
             .rename(.{ .q = .s })
             .merge(.{ .d = .{ .h, .hd } });
-        return self.to_out.forward(attn_out);
+        return self.to_out.forward(attn_out.rename(.{ .d = .dout }));
     }
 };
 
@@ -809,8 +830,8 @@ pub const ZImageTransformerBlock = struct {
             const seq_len: u32 = @intCast(x.dim(.s));
 
             const scale_msa, const gate_msa, const scale_mlp, const gate_mlp = if (noise_mask) |mask| blk: {
-                const noisy = mod_layer.forward(adaln_noisy orelse @panic("missing adaln_noisy"));
-                const clean = mod_layer.forward(adaln_clean orelse @panic("missing adaln_clean"));
+                const noisy = mod_layer.forward((adaln_noisy orelse @panic("missing adaln_noisy")).convert(mod_layer.weight.dtype()));
+                const clean = mod_layer.forward((adaln_clean orelse @panic("missing adaln_clean")).convert(mod_layer.weight.dtype()));
                 const scale_msa_noisy, const gate_msa_noisy, const scale_mlp_noisy, const gate_mlp_noisy = splitModulation(noisy);
                 const scale_msa_clean, const gate_msa_clean, const scale_mlp_clean, const gate_mlp_clean = splitModulation(clean);
                 break :blk .{
@@ -820,13 +841,14 @@ pub const ZImageTransformerBlock = struct {
                     selectPerToken(gate_mlp_noisy.tanh(), gate_mlp_clean.tanh(), mask, seq_len),
                 };
             } else blk: {
-                const mod = mod_layer.forward(adaln_input orelse @panic("missing adaln_input"));
+                const mod = mod_layer.forward((adaln_input orelse @panic("missing adaln_input")).convert(mod_layer.weight.dtype()));
                 const msa_scale, const msa_gate, const mlp_scale, const mlp_gate = splitModulation(mod);
+                const mod_shape = zml.Shape.init(.{ .s = seq_len, .d = msa_scale.dim(.d) }, msa_scale.dtype());
                 break :blk .{
-                    msa_scale.addConstant(1.0).insertAxes(.d, .{.s}),
-                    msa_gate.tanh().insertAxes(.d, .{.s}),
-                    mlp_scale.addConstant(1.0).insertAxes(.d, .{.s}),
-                    mlp_gate.tanh().insertAxes(.d, .{.s}),
+                    msa_scale.addConstant(1.0).insertAxes(.d, .{.s}).broad(mod_shape),
+                    msa_gate.tanh().insertAxes(.d, .{.s}).broad(mod_shape),
+                    mlp_scale.addConstant(1.0).insertAxes(.d, .{.s}).broad(mod_shape),
+                    mlp_gate.tanh().insertAxes(.d, .{.s}).broad(mod_shape),
                 };
             };
 

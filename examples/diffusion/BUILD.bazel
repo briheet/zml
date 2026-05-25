@@ -5,5 +5,8 @@ zig_binary(
     srcs = glob(["**/*.zig"]),
     main = "main.zig",
     visibility = ["//visibility:public"],
-    deps = ["//zml"],
+    deps = [
+        "//zml",
+        "@zigimg//:zigimg",
+    ],
 )

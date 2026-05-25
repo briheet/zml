@@ -16,6 +16,11 @@ pub const SchedulerOutput = struct {
     prev_sample: zml.Tensor,
 };
 
+pub const StepSigmas = struct {
+    current: f32,
+    next: f32,
+};
+
 // ZImagePipeline uses FlowMatchEulerDiscreteScheduler
 pub const Scheduler = struct {
     num_train_timesteps: u32 = 1000,
@@ -107,6 +112,72 @@ pub const Scheduler = struct {
             }
         }
         self.step_index = best_idx;
+    }
+
+    pub fn nextStepSigmas(self: *Scheduler, timestep: f32) StepSigmas {
+        if (self.step_index == null) {
+            self.initStepIndex(timestep);
+        }
+
+        const sigma_idx = self.step_index.?;
+        const current_sigma = self.sigmas[sigma_idx];
+        const next_sigma = self.sigmas[@min(sigma_idx + 1, self.sigmas.len - 1)];
+
+        self.step_index = sigma_idx + 1;
+
+        return .{
+            .current = current_sigma,
+            .next = next_sigma,
+        };
+    }
+
+    pub fn setTimesteps(self: *Scheduler, allocator: std.mem.Allocator, num_inference_steps: u32, mu: ?f32) !void {
+        if (self.use_dynamic_shifting and mu == null) return error.MissingDynamicShift;
+        if (num_inference_steps == 0) return error.InvalidNumInferenceSteps;
+
+        const timesteps = try allocator.alloc(f32, num_inference_steps);
+        errdefer allocator.free(timesteps);
+        const sigmas = try allocator.alloc(f32, num_inference_steps + 1);
+        errdefer allocator.free(sigmas);
+
+        const num_train_timesteps_f32 = @as(f32, @floatFromInt(self.num_train_timesteps));
+        const start_t = self.sigma_max * num_train_timesteps_f32;
+        const end_t = self.sigma_min * num_train_timesteps_f32;
+        const denom = @max(num_inference_steps - 1, 1);
+        const denom_f32 = @as(f32, @floatFromInt(denom));
+
+        for (0..num_inference_steps) |i| {
+            const alpha = @as(f32, @floatFromInt(i)) / denom_f32;
+            const base_t = start_t + (end_t - start_t) * alpha;
+            var sigma = base_t / num_train_timesteps_f32;
+
+            if (self.use_dynamic_shifting) {
+                const mu_ = mu.?;
+                sigma = switch (self.time_shift_type) {
+                    .exponential => blk: {
+                        const exp_mu = std.math.exp(mu_);
+                        break :blk exp_mu / (exp_mu + std.math.pow(f32, 1.0 / sigma - 1.0, 1.0));
+                    },
+                    .linear => mu_ / (mu_ + 1.0 / sigma - 1.0),
+                };
+            } else {
+                sigma = self.shift * sigma / (1 + (self.shift - 1) * sigma);
+            }
+
+            sigmas[i] = sigma;
+            timesteps[i] = sigma * num_train_timesteps_f32;
+        }
+
+        sigmas[num_inference_steps] = 0.0;
+
+        allocator.free(self.timesteps);
+        allocator.free(self.sigmas);
+        self.timesteps = timesteps;
+        self.sigmas = sigmas;
+        self.sigma_min = sigmas[num_inference_steps - 1];
+        self.sigma_max = sigmas[0];
+        self.step_index = null;
+        self.begin_index = null;
     }
 
     pub fn step(

@@ -132,6 +132,10 @@ pub const AutoEncoder = struct {
         };
     }
 
+    pub fn decodeLatents(self: *const AutoEncoder, latents: zml.Tensor) zml.Tensor {
+        return self.decodeInternal(latents.rename(.{ .f = .b }).transpose(.{ .b, .c, .h, .w }));
+    }
+
     // Encoder layer for variational autoencoder that encoder input data into latent representation
     // Can be used in other vae's aswell
     pub const Encoder = struct {
@@ -362,24 +366,25 @@ pub const Conv2d = struct {
     }
 
     pub fn forward(self: Conv2d, input: zml.Tensor) zml.Tensor {
-        var out = zml.Tensor.conv2d(input, self.weight, .{
+        const input_t = input.convert(self.weight.dtype());
+        var out = zml.Tensor.conv2d(input_t, self.weight, .{
             .window_strides = &.{ self.stride, self.stride },
             .padding = &.{ self.padding, self.padding, self.padding, self.padding },
-            .input_batch_dimension = input.axis(.b),
-            .input_feature_dimension = input.axis(.c),
-            .input_spatial_dimensions = &.{ input.axis(.h), input.axis(.w) },
+            .input_batch_dimension = input_t.axis(.b),
+            .input_feature_dimension = input_t.axis(.c),
+            .input_spatial_dimensions = &.{ input_t.axis(.h), input_t.axis(.w) },
             .kernel_output_feature_dimension = self.weight.axis(.cout),
             .kernel_input_feature_dimension = self.weight.axis(.cin),
             .kernel_spatial_dimensions = &.{ self.weight.axis(.kh), self.weight.axis(.kw) },
-            .output_batch_dimension = input.axis(.b),
-            .output_feature_dimension = input.axis(.c),
-            .output_spatial_dimensions = &.{ input.axis(.h), input.axis(.w) },
-        }).rename(.{ .cout = .c });
+            .output_batch_dimension = input_t.axis(.b),
+            .output_feature_dimension = input_t.axis(.c),
+            .output_spatial_dimensions = &.{ input_t.axis(.h), input_t.axis(.w) },
+        });
 
         if (self.bias) |bias| {
-            out = out.add(bias.rename(.{ .cout = .c }).broad(out.shape()));
+            out = out.add(bias.convert(out.dtype()).broadcast(out.shape(), &.{out.axis(.c)}));
         }
-        return out;
+        return out.convert(input.dtype());
     }
 };
 
@@ -405,15 +410,17 @@ pub const GroupNorm = struct {
     }
 
     pub fn forward(self: GroupNorm, x: zml.Tensor) zml.Tensor {
-        const split = x.splitAxis(.c, .{ .g = self.num_groups, .cg = .auto });
+        const input_dtype = x.dtype();
+        const x_f32 = x.convert(.f32);
+        const split = x_f32.splitAxis(.c, .{ .g = self.num_groups, .cg = .auto });
         const grouped = split.merge(.{ .d = .{ .cg, .h, .w } });
         const normed = zml.nn.normalizeVariance(grouped, self.eps)
-            .splitAxis(.d, .{ .cg = @divExact(@as(u32, @intCast(x.dim(.c))), self.num_groups), .hw = x.dim(.h) * x.dim(.w) })
-            .splitAxis(.hw, .{ .h = x.dim(.h), .w = x.dim(.w) })
+            .splitAxis(.d, .{ .cg = @divExact(@as(u32, @intCast(x_f32.dim(.c))), self.num_groups), .hw = x_f32.dim(.h) * x_f32.dim(.w) })
+            .splitAxis(.hw, .{ .h = x_f32.dim(.h), .w = x_f32.dim(.w) })
             .merge(.{ .c = .{ .g, .cg } });
-        var out = normed.mul(self.weight.broad(normed.shape()));
-        if (self.bias) |bias| out = out.add(bias.broad(out.shape()));
-        return out;
+        var out = normed.mul(self.weight.convert(.f32).broad(normed.shape()));
+        if (self.bias) |bias| out = out.add(bias.convert(.f32).broad(out.shape()));
+        return out.convert(input_dtype);
     }
 };
 
@@ -500,7 +507,7 @@ pub const Upsample2D = struct {
     }
 
     pub fn forward(self: Upsample2D, x: zml.Tensor) zml.Tensor {
-        const upsampled = zml.nn.upsample(x, .{ .scale_factor = &.{ 2, 2 }, .mode = .nearest });
+        const upsampled = zml.nn.upsample(x, .{ .scale_factor = &.{ 2, 2 }, .mode = .nearest }).withTags(x.shape());
         return self.conv.forward(upsampled);
     }
 };
@@ -696,7 +703,10 @@ pub const Attention2D = struct {
         const b = normed.dim(.b);
         const h = normed.dim(.h);
         const w = normed.dim(.w);
-        const flat = normed.transpose(.{ .b, .h, .w, .c }).reshape(.{ .b = b, .s = h * w, .d = normed.dim(.c) });
+        const flat = normed
+            .transpose(.{ .b, .h, .w, .c })
+            .reshape(.{ .b = b, .s = h * w, .d = normed.dim(.c) })
+            .convert(self.to_q.weight.dtype());
 
         const q = self.to_q.forward(flat).splitAxis(.dout, .{ .h = self.heads, .hd = self.dim_head }).rename(.{ .s = .q });
         const k = self.to_k.forward(flat).splitAxis(.dout, .{ .h = self.heads, .hd = self.dim_head }).rename(.{ .s = .k });
@@ -705,7 +715,11 @@ pub const Attention2D = struct {
             .insertAxes(.q, .{.b})
             .rename(.{ .q = .s })
             .merge(.{ .d = .{ .h, .hd } });
-        const out = self.to_out.forward(attn).reshape(.{ .b = b, .h = h, .w = w, .c = residual.dim(.c) }).transpose(.{ .b, .c, .h, .w });
+        const out = self.to_out
+            .forward(attn.rename(.{ .d = .dout }))
+            .reshape(.{ .b = b, .h = h, .w = w, .c = residual.dim(.c) })
+            .transpose(.{ .b, .c, .h, .w })
+            .convert(residual.dtype());
         return residual.add(out);
     }
 };

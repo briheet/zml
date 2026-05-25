@@ -18,7 +18,7 @@ const RawConfig = struct {
 };
 
 pub const LoadedModel = union(ModelType) {
-    zimage: zimageModel.LoadedModel,
+    zimage: *zimageModel.LoadedModel,
 
     pub fn load(
         allocator: std.mem.Allocator,
@@ -29,13 +29,21 @@ pub const LoadedModel = union(ModelType) {
         const model_type = try detectModelType(allocator, io, repo);
         log.info("Detected mode type: {}", .{model_type});
         return switch (model_type) {
-            .zimage => .{ .zimage = try zimageModel.LoadedModel.init(allocator, io, repo, store) },
+            .zimage => blk: {
+                const model = try allocator.create(zimageModel.LoadedModel);
+                errdefer allocator.destroy(model);
+                model.* = try zimageModel.LoadedModel.init(allocator, io, repo, store);
+                break :blk .{ .zimage = model };
+            },
         };
     }
 
     pub fn deinit(self: *LoadedModel, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            inline else => |*m| m.deinit(allocator),
+            .zimage => |m| {
+                m.deinit(allocator);
+                allocator.destroy(m);
+            },
         }
     }
 
@@ -50,7 +58,7 @@ pub const LoadedModel = union(ModelType) {
         progress: *std.Progress.Node,
     ) !CompiledModel {
         const inner: CompiledModel.Inner = switch (self.*) {
-            .zimage => |*m| .{ .zimage = try m.compile(
+            .zimage => |m| .{ .zimage = try m.compile(
                 allocator,
                 io,
                 platform,
@@ -77,13 +85,13 @@ pub const LoadedModel = union(ModelType) {
         shardings: Shardings,
     ) !Buffers {
         return switch (self.*) {
-            .zimage => |*m| .{ .zimage = try m.loadBuffers(allocator, io, platform, store, progress, shardings) },
+            .zimage => |m| .{ .zimage = try m.loadBuffers(allocator, io, platform, store, progress, shardings) },
         };
     }
 
     pub fn unloadBuffers(self: *const LoadedModel, buffers: *Buffers, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .zimage => |*loaded_model| switch (buffers.*) {
+            .zimage => |loaded_model| switch (buffers.*) {
                 .zimage => |*loaded_buffers| loaded_model.unloadBuffers(loaded_buffers, allocator),
             },
         }

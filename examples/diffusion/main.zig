@@ -4,8 +4,12 @@ const zml = @import("zml");
 const stdx = zml.stdx;
 const models = @import("models.zig");
 
-const std_options: std.Options = .{
+pub const std_options: std.Options = .{
     .log_level = .info,
+    .log_scope_levels = &.{
+        .{ .scope = .@"zml/io", .level = .err },
+        .{ .scope = .@"zml/module", .level = .err },
+    },
 };
 
 const log = std.log.scoped(.diffusion);
@@ -17,9 +21,11 @@ const log = std.log.scoped(.diffusion);
 const Args = struct {
     model: []const u8,
     prompt: ?[]const u8 = null,
+    negative_prompt: []const u8 = "",
+    guidance_scale: f32 = 5.0,
     seqlen: u32 = 512,
     steps: u32 = 50,
-    output: []const u8 = "zimage.ppm",
+    output: []const u8 = "zimage.png",
     seed: u64 = 0,
 };
 
@@ -28,6 +34,59 @@ const GenerationOptions = struct {
     output: []const u8,
     seed: u64,
 };
+
+fn loadTensorRegistry(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repo: std.Io.Dir,
+) !zml.safetensors.TensorRegistry {
+    var registry = zml.safetensors.TensorRegistry.init(allocator);
+    errdefer registry.deinit();
+
+    const entrypoints = [_][]const u8{
+        "text_encoder/model.safetensors.index.json",
+        "transformer/diffusion_pytorch_model.safetensors.index.json",
+        "vae/diffusion_pytorch_model.safetensors",
+    };
+
+    for (entrypoints) |path| {
+        const component_dir_path = std.fs.path.dirname(path) orelse ".";
+        const entrypoint_name = std.fs.path.basename(path);
+        const component_name = std.fs.path.dirname(path) orelse unreachable;
+
+        var component_repo = try repo.openDir(io, component_dir_path, .{});
+        defer component_repo.close(io);
+
+        const entrypoint = try component_repo.openFile(io, entrypoint_name, .{ .mode = .read_only });
+        defer entrypoint.close(io);
+
+        var component_registry = try zml.safetensors.fetchRegistryWithEntrypointName(
+            allocator,
+            io,
+            component_repo,
+            entrypoint,
+            entrypoint_name,
+        );
+        defer component_registry.deinit();
+
+        try registry.mergeMetadata(component_registry.metadata);
+
+        var it = component_registry.iterator();
+        while (it.next()) |entry| {
+            const prefixed_name = try std.fmt.allocPrint(allocator, "{s}.{s}", .{
+                component_name,
+                entry.value_ptr.name,
+            });
+            defer allocator.free(prefixed_name);
+
+            var tensor = entry.value_ptr.*;
+            tensor.name = prefixed_name;
+            try registry.registerTensor(tensor);
+        }
+    }
+
+    return registry;
+}
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -69,7 +128,9 @@ pub fn main(init: std.process.Init) !void {
     //
     // Platform and backend selection
     //
-    const platform: *zml.Platform = try .auto(allocator, io, .{});
+    const platform: *zml.Platform = try .auto(allocator, io, .{
+        .cpu = .{ .device_count = 1 },
+    });
     defer platform.deinit(allocator, io);
 
     log.info("\n{f}", .{platform.fmtVerbose()});
@@ -81,7 +142,7 @@ pub fn main(init: std.process.Init) !void {
     const repo = try zml.safetensors.resolveModelRepo(io, args.model);
 
     log.info("Initializing model..", .{});
-    var registry: zml.safetensors.TensorRegistry = try .fromRepo(allocator, io, repo);
+    var registry = try loadTensorRegistry(allocator, io, repo);
     defer registry.deinit();
 
     var store: zml.io.TensorStore = .fromRegistry(allocator, &registry);
@@ -99,7 +160,7 @@ pub fn main(init: std.process.Init) !void {
     errdefer progress.end();
 
     var inference_pipeline = switch (model) {
-        .zimage => |*zimage_loaded_model| try models.pipeline.init(
+        .zimage => |zimage_loaded_model| try models.pipeline.init(
             allocator,
             io,
             repo,
@@ -114,6 +175,15 @@ pub fn main(init: std.process.Init) !void {
     defer inference_pipeline.deinit(allocator);
 
     progress.end();
+
+    try inference_pipeline.run(.{
+        .prompt = args.prompt orelse return models.InferenceErrors.MissingPrompt,
+        .negative_prompt = args.negative_prompt,
+        .num_inference_steps = args.steps,
+        .guidance_scale = args.guidance_scale,
+        .seed = args.seed,
+        .output_path = args.output,
+    });
 }
 
 pub fn printZmlLogo(io: std.Io) !void {
