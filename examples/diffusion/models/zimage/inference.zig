@@ -555,6 +555,8 @@ pub const InferencePipeline = struct {
         store: *zml.io.TensorStore,
         shardings: common.Shardings,
         prompt_seqlen: u32,
+        height: u32,
+        width: u32,
         progress: *std.Progress.Node,
     ) !InferencePipeline {
         const backend = zml.attention.attention.Backend.auto(platform);
@@ -566,6 +568,8 @@ pub const InferencePipeline = struct {
             backend,
             shardings,
             prompt_seqlen,
+            height,
+            width,
             progress,
         );
         errdefer compiled_model.deinit();
@@ -657,6 +661,7 @@ pub const InferencePipeline = struct {
             prompt_inputs.used_tokens,
         );
         defer prompt_embeds.deinit();
+        try logBufferStats(self.allocator, self.io, "prompt embeddings", prompt_embeds.embeds);
 
         var negative_prompt_embeds: ?EncodedPrompt = null;
         defer if (negative_prompt_embeds) |*encoded| encoded.deinit();
@@ -694,6 +699,7 @@ pub const InferencePipeline = struct {
                 negative_prompt_embeds_full,
                 negative_prompt_inputs.used_tokens,
             );
+            try logBufferStats(self.allocator, self.io, "negative prompt embeddings", negative_prompt_embeds.?.embeds);
         }
 
         const all_shardings = self.compiled_model.params.shardings.all();
@@ -758,7 +764,6 @@ pub const InferencePipeline = struct {
             const intercept = base_shift - slope * base_seq_len;
             break :blk @as(f32, @floatFromInt(image_seq_len)) * slope + intercept;
         } else null;
-        self.scheduler_state.sigma_min = 0.0;
         try self.scheduler_state.setTimesteps(self.allocator, opts.num_inference_steps, mu);
 
         for (self.scheduler_state.timesteps) |raw_timestep| {

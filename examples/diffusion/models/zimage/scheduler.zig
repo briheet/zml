@@ -141,15 +141,13 @@ pub const Scheduler = struct {
         errdefer allocator.free(sigmas);
 
         const num_train_timesteps_f32 = @as(f32, @floatFromInt(self.num_train_timesteps));
-        const start_t = self.sigma_max * num_train_timesteps_f32;
-        const end_t = self.sigma_min * num_train_timesteps_f32;
-        const denom = @max(num_inference_steps - 1, 1);
-        const denom_f32 = @as(f32, @floatFromInt(denom));
+        const num_inference_steps_f32 = @as(f32, @floatFromInt(num_inference_steps));
 
         for (0..num_inference_steps) |i| {
-            const alpha = @as(f32, @floatFromInt(i)) / denom_f32;
-            const base_t = start_t + (end_t - start_t) * alpha;
-            var sigma = base_t / num_train_timesteps_f32;
+            // ZImagePipeline supplies linspace(1, 1 / steps, steps) before the
+            // FlowMatch scheduler applies its configured shift.
+            const alpha = @as(f32, @floatFromInt(i)) / num_inference_steps_f32;
+            var sigma = 1.0 - alpha;
 
             if (self.use_dynamic_shifting) {
                 const mu_ = mu.?;
@@ -240,3 +238,19 @@ pub const Scheduler = struct {
         return .{ .prev_sample = prev_sample };
     }
 };
+
+test "Z-Image sigma schedule matches FlowMatch defaults" {
+    const allocator = std.testing.allocator;
+    var scheduler = try Scheduler.init(allocator, .{});
+    defer scheduler.deinit(allocator);
+
+    try scheduler.setTimesteps(allocator, 4, null);
+
+    const expected_unshifted = [_]f32{ 1.0, 0.75, 0.5, 0.25 };
+    for (expected_unshifted, scheduler.sigmas[0..4], scheduler.timesteps) |base, sigma, timestep| {
+        const expected = 6.0 * base / (1.0 + 5.0 * base);
+        try std.testing.expectApproxEqAbs(expected, sigma, 1e-6);
+        try std.testing.expectApproxEqAbs(expected * 1000.0, timestep, 1e-3);
+    }
+    try std.testing.expectEqual(@as(f32, 0.0), scheduler.sigmas[4]);
+}

@@ -15,7 +15,7 @@ pub const AutoEncoder = struct {
             "DownEncoderBlock2D",
             "DownEncoderBlock2D",
         },
-        force_upcast: bool = false,
+        force_upcast: bool = true,
         in_channels: u32 = 3,
         latent_channels: u32 = 16,
         latents_mean: ?f32 = null,
@@ -366,25 +366,28 @@ pub const Conv2d = struct {
     }
 
     pub fn forward(self: Conv2d, input: zml.Tensor) zml.Tensor {
-        const input_t = input.convert(self.weight.dtype());
-        var out = zml.Tensor.conv2d(input_t, self.weight, .{
+        // Z-Image's AutoencoderKL checkpoint requires force_upcast. Keep the
+        // decoder in f32 even though its stored weights are bfloat16.
+        const input_f32 = input.convert(.f32);
+        const weight_f32 = self.weight.convert(.f32);
+        var out = zml.Tensor.conv2d(input_f32, weight_f32, .{
             .window_strides = &.{ self.stride, self.stride },
             .padding = &.{ self.padding, self.padding, self.padding, self.padding },
-            .input_batch_dimension = input_t.axis(.b),
-            .input_feature_dimension = input_t.axis(.c),
-            .input_spatial_dimensions = &.{ input_t.axis(.h), input_t.axis(.w) },
-            .kernel_output_feature_dimension = self.weight.axis(.cout),
-            .kernel_input_feature_dimension = self.weight.axis(.cin),
-            .kernel_spatial_dimensions = &.{ self.weight.axis(.kh), self.weight.axis(.kw) },
-            .output_batch_dimension = input_t.axis(.b),
-            .output_feature_dimension = input_t.axis(.c),
-            .output_spatial_dimensions = &.{ input_t.axis(.h), input_t.axis(.w) },
+            .input_batch_dimension = input_f32.axis(.b),
+            .input_feature_dimension = input_f32.axis(.c),
+            .input_spatial_dimensions = &.{ input_f32.axis(.h), input_f32.axis(.w) },
+            .kernel_output_feature_dimension = weight_f32.axis(.cout),
+            .kernel_input_feature_dimension = weight_f32.axis(.cin),
+            .kernel_spatial_dimensions = &.{ weight_f32.axis(.kh), weight_f32.axis(.kw) },
+            .output_batch_dimension = input_f32.axis(.b),
+            .output_feature_dimension = input_f32.axis(.c),
+            .output_spatial_dimensions = &.{ input_f32.axis(.h), input_f32.axis(.w) },
         });
 
         if (self.bias) |bias| {
-            out = out.add(bias.convert(out.dtype()).broadcast(out.shape(), &.{out.axis(.c)}));
+            out = out.add(bias.convert(.f32).broadcast(out.shape(), &.{out.axis(.c)}));
         }
-        return out.convert(input.dtype());
+        return out;
     }
 };
 
@@ -705,21 +708,26 @@ pub const Attention2D = struct {
         const w = normed.dim(.w);
         const flat = normed
             .transpose(.{ .b, .h, .w, .c })
-            .reshape(.{ .b = b, .s = h * w, .d = normed.dim(.c) })
-            .convert(self.to_q.weight.dtype());
+            .reshape(.{ .b = b, .s = h * w, .d = normed.dim(.c) });
 
-        const q = self.to_q.forward(flat).splitAxis(.dout, .{ .h = self.heads, .hd = self.dim_head }).rename(.{ .s = .q });
-        const k = self.to_k.forward(flat).splitAxis(.dout, .{ .h = self.heads, .hd = self.dim_head }).rename(.{ .s = .k });
-        const v = self.to_v.forward(flat).splitAxis(.dout, .{ .h = self.heads, .hd = self.dim_head }).rename(.{ .s = .k });
+        const q = linearF32(self.to_q, flat).splitAxis(.dout, .{ .h = self.heads, .hd = self.dim_head }).rename(.{ .s = .q });
+        const k = linearF32(self.to_k, flat).splitAxis(.dout, .{ .h = self.heads, .hd = self.dim_head }).rename(.{ .s = .k });
+        const v = linearF32(self.to_v, flat).splitAxis(.dout, .{ .h = self.heads, .hd = self.dim_head }).rename(.{ .s = .k });
         const attn = zml.nn.sdpa(q.squeeze(.b), k.squeeze(.b), v.squeeze(.b), .{})
             .insertAxes(.q, .{.b})
             .rename(.{ .q = .s })
             .merge(.{ .d = .{ .h, .hd } });
-        const out = self.to_out
-            .forward(attn.rename(.{ .d = .dout }))
+        const out = linearF32(self.to_out, attn.rename(.{ .d = .dout }))
             .reshape(.{ .b = b, .h = h, .w = w, .c = residual.dim(.c) })
-            .transpose(.{ .b, .c, .h, .w })
-            .convert(residual.dtype());
+            .transpose(.{ .b, .c, .h, .w });
         return residual.add(out);
     }
 };
+
+fn linearF32(linear: zml.nn.Linear, input: zml.Tensor) zml.Tensor {
+    var out = input.convert(.f32).dot(linear.weight.convert(.f32), linear.tag);
+    if (linear.bias) |bias| {
+        out = out.add(bias.convert(.f32).broad(out.shape()));
+    }
+    return out;
+}

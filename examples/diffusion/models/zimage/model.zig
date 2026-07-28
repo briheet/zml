@@ -69,7 +69,6 @@ fn loadTransformerBuffers(
     all_shardings: []const zml.Sharding,
     out: *zml.Bufferized(transformer.Transformer),
 ) !void {
-
     for (&out.all_x_embedder, 0..) |*embedder, i| {
         embedder.* = try zml.io.load(zml.nn.Linear, &model.all_x_embedder[i], allocator, io, platform, store, .{
             .dma_chunks = load_dma_chunks,
@@ -313,21 +312,49 @@ fn loadVaeAttentionBuffers(
     out.norm = try loadVaeGroupNormBuffers(&model.norm, allocator, io, platform, store, progress, all_shardings);
     errdefer vae.GroupNorm.unloadBuffers(&out.norm);
     out.to_q = try zml.io.load(zml.nn.Linear, &model.to_q, allocator, io, platform, store, .{
-        .dma_chunks = load_dma_chunks, .dma_chunk_size = load_dma_chunk_size, .progress = progress, .shardings = all_shardings, .parallelism = load_parallelism,
+        .dma_chunks = load_dma_chunks,
+        .dma_chunk_size = load_dma_chunk_size,
+        .progress = progress,
+        .shardings = all_shardings,
+        .parallelism = load_parallelism,
     });
-    errdefer { out.to_q.weight.deinit(); if (out.to_q.bias) |*b| b.deinit(); }
+    errdefer {
+        out.to_q.weight.deinit();
+        if (out.to_q.bias) |*b| b.deinit();
+    }
     out.to_k = try zml.io.load(zml.nn.Linear, &model.to_k, allocator, io, platform, store, .{
-        .dma_chunks = load_dma_chunks, .dma_chunk_size = load_dma_chunk_size, .progress = progress, .shardings = all_shardings, .parallelism = load_parallelism,
+        .dma_chunks = load_dma_chunks,
+        .dma_chunk_size = load_dma_chunk_size,
+        .progress = progress,
+        .shardings = all_shardings,
+        .parallelism = load_parallelism,
     });
-    errdefer { out.to_k.weight.deinit(); if (out.to_k.bias) |*b| b.deinit(); }
+    errdefer {
+        out.to_k.weight.deinit();
+        if (out.to_k.bias) |*b| b.deinit();
+    }
     out.to_v = try zml.io.load(zml.nn.Linear, &model.to_v, allocator, io, platform, store, .{
-        .dma_chunks = load_dma_chunks, .dma_chunk_size = load_dma_chunk_size, .progress = progress, .shardings = all_shardings, .parallelism = load_parallelism,
+        .dma_chunks = load_dma_chunks,
+        .dma_chunk_size = load_dma_chunk_size,
+        .progress = progress,
+        .shardings = all_shardings,
+        .parallelism = load_parallelism,
     });
-    errdefer { out.to_v.weight.deinit(); if (out.to_v.bias) |*b| b.deinit(); }
+    errdefer {
+        out.to_v.weight.deinit();
+        if (out.to_v.bias) |*b| b.deinit();
+    }
     out.to_out = try zml.io.load(zml.nn.Linear, &model.to_out, allocator, io, platform, store, .{
-        .dma_chunks = load_dma_chunks, .dma_chunk_size = load_dma_chunk_size, .progress = progress, .shardings = all_shardings, .parallelism = load_parallelism,
+        .dma_chunks = load_dma_chunks,
+        .dma_chunk_size = load_dma_chunk_size,
+        .progress = progress,
+        .shardings = all_shardings,
+        .parallelism = load_parallelism,
     });
-    errdefer { out.to_out.weight.deinit(); if (out.to_out.bias) |*b| b.deinit(); }
+    errdefer {
+        out.to_out.weight.deinit();
+        if (out.to_out.bias) |*b| b.deinit();
+    }
     return out;
 }
 
@@ -584,11 +611,10 @@ pub const Model = struct {
 
     pub fn unloadBuffers(self: *zml.Bufferized(Model), allocator: std.mem.Allocator) void {
         text_encoder.Qwen3Model.unloadBuffers(&self.text_encoder.inner.model, allocator);
-        self.text_encoder.inner.lm_head.weight.deinit();
+        if (self.text_encoder.inner.lm_head) |*lm_head| lm_head.weight.deinit();
         transformer.Transformer.unloadBuffers(&self.transformer);
         unloadVaeBuffers(&self.vae, allocator);
     }
-
 };
 
 pub const SchedulerStepKernel = struct {
@@ -717,7 +743,7 @@ pub const LoadedModel = struct {
 
         out.text_encoder = try loadTextEncoderBuffers(&self.inner.text_encoder, allocator, io, platform, store, progress, &all_shardings);
         errdefer text_encoder.Qwen3Model.unloadBuffers(&out.text_encoder.inner.model, allocator);
-        errdefer out.text_encoder.inner.lm_head.weight.deinit();
+        errdefer if (out.text_encoder.inner.lm_head) |*lm_head| lm_head.weight.deinit();
 
         try loadTransformerBuffers(&self.inner.transformer, allocator, io, platform, store, progress, &all_shardings, &out.transformer);
         errdefer transformer.Transformer.unloadBuffers(&out.transformer);
@@ -739,14 +765,17 @@ pub const LoadedModel = struct {
         backend: zml.attention.attention.Backend,
         shardings: common.Shardings,
         seqlen: usize,
+        height: u32,
+        width: u32,
         progress: *std.Progress.Node,
     ) !inference.CompiledModel {
         _ = backend;
+        if (height % 16 != 0 or width % 16 != 0) return inference.InferenceErrors.InvalidImageSize;
         const params = inference.CompilationParameters.init(
             @intCast(seqlen),
             1,
-            128,
-            128,
+            height / 8,
+            width / 8,
             shardings,
         );
         return inference.CompiledModel.init(allocator, io, platform, self, params, progress);

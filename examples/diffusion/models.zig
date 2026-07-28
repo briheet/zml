@@ -55,6 +55,8 @@ pub const LoadedModel = union(ModelType) {
         backend: zml.attention.attention.Backend,
         shardings: Shardings,
         seqlen: usize,
+        height: u32,
+        width: u32,
         progress: *std.Progress.Node,
     ) !CompiledModel {
         const inner: CompiledModel.Inner = switch (self.*) {
@@ -65,6 +67,8 @@ pub const LoadedModel = union(ModelType) {
                 backend,
                 shardings,
                 seqlen,
+                height,
+                width,
                 progress,
             ) },
         };

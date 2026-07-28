@@ -58,22 +58,23 @@ pub const TextEncoder = struct {
 pub const Qwen3ForCausalLM = struct {
     model: Qwen3Model,
     vocab_size: u32,
-    lm_head: zml.nn.Linear,
+    lm_head: ?zml.nn.Linear,
 
     pub fn init(allocator: std.mem.Allocator, store: zml.io.TensorStore.View, config: TextEncoder.Config) !Qwen3ForCausalLM {
-        const lm_head_prefix = if (store.hasKey("lm_head.weight")) "lm_head" else "model.embed_tokens";
-
         return .{
             .model = try Qwen3Model.init(allocator, store.withPrefix("model"), config),
             .vocab_size = config.vocab_size,
-            .lm_head = .init(
-                store.withPrefix(lm_head_prefix).createTensor("weight", .{ .voc, .d }, .{
-                    .voc = .replicated,
-                    .d = .model,
-                }),
+            .lm_head = if (store.hasKey("lm_head.weight"))
+                .init(
+                    store.withPrefix("lm_head").createTensor("weight", .{ .voc, .d }, .{
+                        .voc = .replicated,
+                        .d = .model,
+                    }),
+                    null,
+                    .d,
+                )
+            else
                 null,
-                .d,
-            ),
         };
     }
 
@@ -83,7 +84,7 @@ pub const Qwen3ForCausalLM = struct {
 
     pub fn forward(self: Qwen3ForCausalLM, input_ids: zml.Tensor) zml.Tensor {
         const hidden_states = self.model.forward(input_ids, null, null);
-        return self.lm_head.forward(hidden_states);
+        return (self.lm_head orelse @panic("missing lm_head")).forward(hidden_states);
     }
 
     pub fn forwardHidden(self: Qwen3ForCausalLM, input_ids: zml.Tensor, attention_mask: ?zml.Tensor) zml.Tensor {
@@ -91,7 +92,14 @@ pub const Qwen3ForCausalLM = struct {
     }
 
     pub fn encodePrompt(self: Qwen3ForCausalLM, input_ids: zml.Tensor, attention_mask: zml.Tensor) zml.Tensor {
-        return self.model.forwardPreNorm(input_ids, attention_mask, null).squeeze(.b).convert(.f32);
+        // Diffusers requests hidden_states[-2], which is the input to Qwen3's
+        // final decoder layer rather than the final normalized model output.
+        return self.model.forwardThroughLayers(
+            input_ids,
+            attention_mask,
+            null,
+            self.model.layers.len - 1,
+        ).squeeze(.b).convert(.f32);
     }
 };
 
@@ -167,6 +175,17 @@ pub const Qwen3Model = struct {
         attention_mask: ?zml.Tensor,
         position_ids: ?zml.Tensor,
     ) zml.Tensor {
+        return self.forwardThroughLayers(input_ids, attention_mask, position_ids, self.layers.len);
+    }
+
+    pub fn forwardThroughLayers(
+        self: Qwen3Model,
+        input_ids: zml.Tensor,
+        attention_mask: ?zml.Tensor,
+        position_ids: ?zml.Tensor,
+        layer_count: usize,
+    ) zml.Tensor {
+        std.debug.assert(layer_count <= self.layers.len);
         var hidden_states = self.embed_tokens.weight.gather(.{ .voc = input_ids }, .{});
         const resolved_position_ids = position_ids orelse zml.Tensor.arange(.{ .end = hidden_states.dim(.s) }, .i64)
             .withTags(.{.s})
@@ -174,7 +193,7 @@ pub const Qwen3Model = struct {
             .broad(zml.Shape.init(.{ .b = hidden_states.dim(.b), .s = hidden_states.dim(.s) }, .i64));
         const position_embeddings = self.rotary_emb.forward(hidden_states, resolved_position_ids);
 
-        for (self.layers) |layer| {
+        for (self.layers[0..layer_count]) |layer| {
             hidden_states = layer.forward(
                 hidden_states,
                 attention_mask,
@@ -492,14 +511,14 @@ pub const Qwen3Attention = struct {
     pub fn repeatKv(hidden_states: zml.Tensor, n_rep: u32) zml.Tensor {
         if (n_rep == 1) return hidden_states;
 
-        const with_group = hidden_states.insertAxes(.hk, .{.g}).broad(zml.Shape.init(.{
+        const with_group = hidden_states.insertAxes(.hd, .{.g}).broad(zml.Shape.init(.{
             .b = hidden_states.dim(.b),
             .s = hidden_states.dim(.s),
-            .g = n_rep,
             .hk = hidden_states.dim(.hk),
+            .g = n_rep,
             .hd = hidden_states.dim(.hd),
         }, hidden_states.dtype()));
-        return with_group.merge(.{ .h = .{ .g, .hk } });
+        return with_group.merge(.{ .h = .{ .hk, .g } });
     }
 };
 
@@ -557,3 +576,34 @@ pub const Qwen3MLP = struct {
         return self.down_proj.forward(activated.mul(up));
     }
 };
+
+test "repeatKv keeps repetitions adjacent to their source head" {
+    const platform = zml.testing.env();
+    const input: zml.Tensor = .init(.{ .b = 1, .s = 1, .hk = 2, .hd = 1 }, .f32);
+
+    const forward = struct {
+        fn forward(x: zml.Tensor) zml.Tensor {
+            return Qwen3Attention.repeatKv(x, 2);
+        }
+    }.forward;
+
+    var exe = try zml.module.compile(std.testing.allocator, std.testing.io, forward, .{input}, platform, .{});
+    defer exe.deinit();
+
+    var input_buffer = try zml.Buffer.fromBytes(
+        std.testing.io,
+        platform,
+        input.shape(),
+        .replicated,
+        std.mem.sliceAsBytes(&[_]f32{ 10, 20 }),
+    );
+    defer input_buffer.deinit();
+
+    var result = try zml.testing.autoCall(std.testing.allocator, std.testing.io, &exe, forward, .{input_buffer});
+    defer result.deinit();
+
+    try std.testing.expectEqual(
+        [1][1][4][1]f32{.{.{ .{10}, .{10}, .{20}, .{20} }}},
+        try result.getValue([1][1][4][1]f32, std.testing.io),
+    );
+}

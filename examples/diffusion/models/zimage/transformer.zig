@@ -235,15 +235,30 @@ pub const Transformer = struct {
 
         const timestep_embed = self.t_embedder.forward(t.convert(.f32).scale(self.t_scale)).squeeze(.b);
         const x_patches = patchifyImage(image, patch_size, f_patch_size).convert(self.all_x_embedder[0].weight.dtype());
-        const x_pos_ids = createCoordinateGrid(
+        const cap_len: u32 = @intCast(cap_feat.dim(.s));
+        const padded_cap_len = std.mem.alignForward(u32, cap_len, SEQ_MULTI_OF);
+        const x_token_count: u32 = @intCast(x_patches.dim(.s));
+        const padded_x_token_count = std.mem.alignForward(u32, x_token_count, SEQ_MULTI_OF);
+
+        var x_pos_ids = createCoordinateGrid(
             .{
                 @divExact(size.f, f_patch_size),
                 @divExact(size.h, patch_size),
                 @divExact(size.w, patch_size),
             },
-            .{ 0, 0, 0 },
+            .{ padded_cap_len + 1, 0, 0 },
         );
         var x_hidden = self.all_x_embedder[0].forward(x_patches).rename(.{ .dout = .d });
+        if (padded_x_token_count > x_token_count) {
+            const pad_len = padded_x_token_count - x_token_count;
+            const pad_shape = zml.Shape.init(.{ .s = pad_len, .d = self.dim }, self.x_pad_token.dtype());
+            const pad_tokens = self.x_pad_token.rename(.{ .tok = .s }).broad(pad_shape);
+            x_hidden = zml.Tensor.concatenate(&.{ x_hidden, pad_tokens }, .s);
+            x_pos_ids = zml.Tensor.concatenate(&.{
+                x_pos_ids,
+                zml.Tensor.zeroes(.init(.{ .s = pad_len, .coord = 3 }, .i32)),
+            }, .s);
+        }
         const x_freqs = self.rope_embedder.forward(x_pos_ids);
 
         for (self.noise_refiner) |layer| {
@@ -251,8 +266,12 @@ pub const Transformer = struct {
         }
 
         var cap_hidden = self.cap_embedder.forward(cap_feat).rename(.{ .dout = .d });
-        const cap_len: u32 = @intCast(cap_hidden.dim(.s));
-        const cap_pos_ids = createCoordinateGrid(.{ cap_len, 1, 1 }, .{ 1, 0, 0 });
+        if (padded_cap_len > cap_len) {
+            const pad_shape = zml.Shape.init(.{ .s = padded_cap_len - cap_len, .d = self.dim }, self.cap_pad_token.dtype());
+            const pad_tokens = self.cap_pad_token.rename(.{ .tok = .s }).broad(pad_shape);
+            cap_hidden = zml.Tensor.concatenate(&.{ cap_hidden, pad_tokens }, .s);
+        }
+        const cap_pos_ids = createCoordinateGrid(.{ padded_cap_len, 1, 1 }, .{ 1, 0, 0 });
         const cap_freqs = self.rope_embedder.forward(cap_pos_ids);
 
         for (self.context_refiner) |layer| {
@@ -577,11 +596,9 @@ pub const RopeEmbedder = struct {
             const half = @divFloor(self.axes_dims[i], 2);
             const freqs = zml.Tensor.arange(.{ .end = half }, .f32)
                 .withTags(.{.hd})
-                .scale(-std.math.log(f32, std.math.e, self.theta) / @as(f32, @floatFromInt(self.axes_dims[i])))
+                .scale(-2.0 * std.math.log(f32, std.math.e, self.theta) / @as(f32, @floatFromInt(self.axes_dims[i])))
                 .exp();
-            const args = axis_ids.convert(.f32).outer(freqs);
-            const emb = zml.Tensor.concatenate(&.{ args, args }, -1);
-            result[i] = zml.Tensor.concatenate(&.{ emb.cos(), emb.sin() }, -1);
+            result[i] = axis_ids.convert(.f32).outer(freqs);
         }
 
         return zml.Tensor.concatenate(&result, -1);
@@ -713,20 +730,17 @@ pub const ZSingleStreamAttention = struct {
         if (self.norm_k) |*norm| RMSNorm.unloadBuffers(norm);
     }
 
-    fn rotateHalf(x: zml.Tensor) zml.Tensor {
-        const half_dim = @divExact(x.dim(-1), 2);
-        const x1 = x.slice1d(-1, .{ .start = 0, .end = half_dim });
-        const x2 = x.slice1d(-1, .{ .start = half_dim, .end = x.dim(-1) });
-        return zml.Tensor.concatenate(&.{ x2.negate(), x1 }, -1);
-    }
-
     fn applyFreqs(x: zml.Tensor, freqs_cis: zml.Tensor, seq_tag: zml.Shape.Tag) zml.Tensor {
-        const half_dim = @divExact(freqs_cis.dim(-1), 2);
-        const cos = freqs_cis.slice1d(-1, .{ .start = 0, .end = half_dim }).rename(.{ .s = seq_tag }).convert(x.dtype());
-        const sin = freqs_cis.slice1d(-1, .{ .start = half_dim, .end = freqs_cis.dim(-1) }).rename(.{ .s = seq_tag }).convert(x.dtype());
-        const cos_x = cos.insertAxes(.hd, .{.h}).broad(x.shape());
-        const sin_x = sin.insertAxes(.hd, .{.h}).broad(x.shape());
-        return x.mul(cos_x).add(rotateHalf(x).mul(sin_x));
+        const paired = x.splitAxis(.hd, .{ .pair = .auto, .ri = 2 });
+        const real = paired.slice1d(.ri, .single(0));
+        const imag = paired.slice1d(.ri, .single(1));
+        const phases = freqs_cis.rename(.{ .s = seq_tag, .hd = .pair }).convert(x.dtype());
+        const cos = phases.cos().insertAxes(.pair, .{.h}).broad(real.shape());
+        const sin = phases.sin().insertAxes(.pair, .{.h}).broad(real.shape());
+        const rotated_real = real.mul(cos).sub(imag.mul(sin));
+        const rotated_imag = real.mul(sin).add(imag.mul(cos));
+        return zml.Tensor.stack(&.{ rotated_real, rotated_imag }, .last, .ri)
+            .merge(.{ .hd = .{ .pair, .ri } });
     }
 
     pub fn forward(

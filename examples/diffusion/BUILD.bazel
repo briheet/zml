@@ -1,4 +1,4 @@
-load("@rules_zig//zig:defs.bzl", "zig_binary")
+load("@rules_zig//zig:defs.bzl", "zig_binary", "zig_test")
 
 zig_binary(
     name = "diffusion",
@@ -7,6 +7,18 @@ zig_binary(
     visibility = ["//visibility:public"],
     deps = [
         "//zml",
-        "@zigimg//:zigimg",
+        "@zigimg",
     ],
+)
+
+zig_test(
+    name = "scheduler_test",
+    main = "models/zimage/scheduler.zig",
+    deps = ["//zml"],
+)
+
+zig_test(
+    name = "text_encoder_test",
+    main = "models/zimage/text_encoder.zig",
+    deps = ["//zml"],
 )

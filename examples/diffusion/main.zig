@@ -23,6 +23,9 @@ const Args = struct {
     prompt: ?[]const u8 = null,
     negative_prompt: []const u8 = "",
     guidance_scale: f32 = 5.0,
+    cfg_normalization: bool = false,
+    height: u32 = 1024,
+    width: u32 = 1024,
     seqlen: u32 = 512,
     steps: u32 = 50,
     output: []const u8 = "zimage.png",
@@ -60,12 +63,11 @@ fn loadTensorRegistry(
         const entrypoint = try component_repo.openFile(io, entrypoint_name, .{ .mode = .read_only });
         defer entrypoint.close(io);
 
-        var component_registry = try zml.safetensors.fetchRegistryWithEntrypointName(
+        var component_registry = try zml.safetensors.fetchRegistry(
             allocator,
             io,
             component_repo,
             entrypoint,
-            entrypoint_name,
         );
         defer component_registry.deinit();
 
@@ -169,6 +171,8 @@ pub fn main(init: std.process.Init) !void {
             &store,
             shardings,
             args.seqlen,
+            args.height,
+            args.width,
             &progress,
         ),
     };
@@ -181,6 +185,9 @@ pub fn main(init: std.process.Init) !void {
         .negative_prompt = args.negative_prompt,
         .num_inference_steps = args.steps,
         .guidance_scale = args.guidance_scale,
+        .cfg_normalization = args.cfg_normalization,
+        .height = args.height,
+        .width = args.width,
         .seed = args.seed,
         .output_path = args.output,
     });
