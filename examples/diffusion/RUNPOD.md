@@ -196,7 +196,44 @@ Subsequent runs reuse both `/workspace/.cache/bazel` and the model snapshot in
 `/workspace/models/Z-Image`. Model weights still have to be read from local disk
 and loaded into VRAM for each new process.
 
-## 8. Copy generated images locally
+## 8. Benchmark cold end-to-end latency
+
+Build the CUDA target first so the timed command does not include Bazel
+compilation:
+
+```bash
+bazel --output_user_root=/workspace/.cache/bazel build \
+  --config=release \
+  --@zml//platforms:cuda=true \
+  --@zml//platforms:cpu=false \
+  //examples/diffusion
+```
+
+Then time the complete process:
+
+```bash
+/usr/bin/time -f $'\nwall=%e\nuser=%U\nsystem=%S\nmax_rss_kb=%M' \
+bazel --output_user_root=/workspace/.cache/bazel run \
+  --config=release \
+  --@zml//platforms:cuda=true \
+  --@zml//platforms:cpu=false \
+  //examples/diffusion -- \
+  --model=/workspace/models/Z-Image \
+  --prompt="A red cube on a white table, studio photograph" \
+  --height=256 \
+  --width=256 \
+  --steps=28 \
+  --guidance-scale=4 \
+  --seqlen=64 \
+  --seed=42 \
+  --output=/workspace/zml-benchmark.png
+```
+
+This is a cold end-to-end measurement. It includes model loading, runtime PJRT
+compilation, inference, VAE decoding, and PNG writing. Bazel's action cache does
+not persist PJRT executables between processes.
+
+## 9. Copy generated images locally
 
 Run this from the local machine:
 
