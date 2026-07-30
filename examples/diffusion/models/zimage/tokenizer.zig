@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const zml = @import("zml");
+const common = @import("../common.zig");
 
 pub const AddedToken = struct {
     content: []const u8,
@@ -43,6 +44,16 @@ const ConfigOverrides = struct {
     unk_token: ?[]const u8 = null,
 };
 
+pub const PromptEncoding = struct {
+    ids: zml.Slice,
+    mask: zml.Slice,
+
+    pub fn deinit(self: *PromptEncoding, allocator: std.mem.Allocator) void {
+        self.ids.free(allocator);
+        self.mask.free(allocator);
+    }
+};
+
 pub const Tokenizer = struct {
     inner: zml.tokenizer.Tokenizer,
     config: Config,
@@ -64,31 +75,15 @@ pub const Tokenizer = struct {
         };
     }
 
-    pub fn fromFile(
-        allocator: std.mem.Allocator,
-        io: std.Io,
-        tokenizer_path: []const u8,
-        config: Config,
-    ) !Tokenizer {
-        return .{
-            .inner = try zml.tokenizer.Tokenizer.fromFile(allocator, io, tokenizer_path),
-            .config = config,
-        };
-    }
-
     pub fn fromDir(
         allocator: std.mem.Allocator,
         io: std.Io,
         dir: std.Io.Dir,
+        files: common.RepositoryFiles,
         config: Config,
     ) !Tokenizer {
         const bytes = b: {
-            const candidates = [_][]const u8{
-                "tokenizer.json",
-                "tokenizer/tokenizer.json",
-            };
-
-            for (candidates) |path| {
+            for (files.tokenizer) |path| {
                 const file = dir.openFile(io, path, .{}) catch |err| switch (err) {
                     error.FileNotFound => continue,
                     else => return err,
@@ -104,12 +99,7 @@ pub const Tokenizer = struct {
         defer allocator.free(bytes);
 
         const parsed_config = cfg: {
-            const candidates = [_][]const u8{
-                "tokenizer_config.json",
-                "tokenizer/tokenizer_config.json",
-            };
-
-            for (candidates) |path| {
+            for (files.tokenizer_config) |path| {
                 const file = dir.openFile(io, path, .{}) catch |err| switch (err) {
                     error.FileNotFound => continue,
                     else => return err,
@@ -179,6 +169,43 @@ pub const Tokenizer = struct {
 
     pub fn unkTokenId(self: *const Tokenizer) ?u32 {
         return if (self.config.unk_token) |token| self.tokenId(token) else null;
+    }
+
+    pub fn encodePromptAlloc(
+        self: *const Tokenizer,
+        allocator: std.mem.Allocator,
+        prompt: []const u8,
+        max_sequence_length: u32,
+    ) !PromptEncoding {
+        const rendered_prompt = try self.applyUserChatTemplateAlloc(allocator, prompt);
+        defer allocator.free(rendered_prompt);
+
+        var prompt_encoder = try self.encoder();
+        defer prompt_encoder.deinit();
+
+        const prompt_tokens = try prompt_encoder.encodeAlloc(allocator, rendered_prompt);
+        defer allocator.free(prompt_tokens);
+
+        if (prompt_tokens.len > max_sequence_length) return error.PromptTooLong;
+
+        const token_shape = zml.Shape.init(.{ .b = 1, .s = max_sequence_length }, .u32);
+        var ids = try zml.Slice.alloc(allocator, token_shape);
+        errdefer ids.free(allocator);
+        const token_items = ids.items(u32);
+        @memset(token_items, self.padTokenId() orelse 0);
+        @memcpy(token_items[0..prompt_tokens.len], prompt_tokens);
+
+        const mask_shape = zml.Shape.init(.{ .b = 1, .s = max_sequence_length }, .bool);
+        var mask = try zml.Slice.alloc(allocator, mask_shape);
+        errdefer mask.free(allocator);
+        const mask_items = mask.items(bool);
+        @memset(mask_items, false);
+        @memset(mask_items[0..prompt_tokens.len], true);
+
+        return .{
+            .ids = ids,
+            .mask = mask,
+        };
     }
 
     pub fn applyUserChatTemplateAlloc(self: *const Tokenizer, allocator: std.mem.Allocator, prompt: []const u8) ![]u8 {

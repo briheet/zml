@@ -41,7 +41,6 @@ pub const RunOptions = struct {
     num_inference_steps: u32 = 50,
     guidance_scale: f32 = 5.0,
     cfg_normalization: bool = false,
-    seed: u64 = 0,
     output_path: []const u8,
 };
 
@@ -73,10 +72,11 @@ pub const CompiledModel = struct {
     loaded_model: *const zimage_model.LoadedModel,
     params: CompilationParameters,
 
-    // text_encoder->transformer->vae
     text_encoder: zml.Exe,
     transformer: zml.Exe,
+    latent_generator: zml.Exe,
     scheduler_step: zml.Exe,
+    guided_scheduler_step: zml.Exe,
     vae_decode: zml.Exe,
 
     pub fn init(
@@ -87,14 +87,16 @@ pub const CompiledModel = struct {
         params: CompilationParameters,
         progress: *std.Progress.Node,
     ) !CompiledModel {
-        const compiled_result = try compile_whole_model(allocator, io, platform, loaded_model, params, progress);
+        const compiled_result = try compileExecutables(allocator, io, platform, loaded_model, params, progress);
         return .{
             .loaded_model = loaded_model,
             .params = params,
 
             .text_encoder = compiled_result.text_encoder,
             .transformer = compiled_result.transformer,
+            .latent_generator = compiled_result.latent_generator,
             .scheduler_step = compiled_result.scheduler_step,
+            .guided_scheduler_step = compiled_result.guided_scheduler_step,
             .vae_decode = compiled_result.vae_decode,
         };
     }
@@ -102,7 +104,9 @@ pub const CompiledModel = struct {
     pub fn deinit(self: *CompiledModel) void {
         self.text_encoder.deinit();
         self.transformer.deinit();
+        self.latent_generator.deinit();
         self.scheduler_step.deinit();
+        self.guided_scheduler_step.deinit();
         self.vae_decode.deinit();
     }
 };
@@ -110,7 +114,9 @@ pub const CompiledModel = struct {
 pub const CompiledModelResult = struct {
     text_encoder: zml.Exe,
     transformer: zml.Exe,
+    latent_generator: zml.Exe,
     scheduler_step: zml.Exe,
+    guided_scheduler_step: zml.Exe,
     vae_decode: zml.Exe,
 };
 
@@ -132,7 +138,6 @@ const BufferStats = struct {
 const PromptInputs = struct {
     ids: zml.Buffer,
     mask: zml.Buffer,
-    used_tokens: u32,
 
     fn deinit(self: *PromptInputs) void {
         self.ids.deinit();
@@ -142,10 +147,19 @@ const PromptInputs = struct {
 
 const EncodedPrompt = struct {
     embeds: zml.Buffer,
-    seq_len: u32,
 
     fn deinit(self: *EncodedPrompt) void {
         self.embeds.deinit();
+    }
+};
+
+const EncodedPrompts = struct {
+    positive: EncodedPrompt,
+    negative: ?EncodedPrompt,
+
+    fn deinit(self: *EncodedPrompts) void {
+        self.positive.deinit();
+        if (self.negative) |*negative| negative.deinit();
     }
 };
 
@@ -234,18 +248,6 @@ fn logBufferStats(
     log.info("{s}: {}", .{ label, computeSliceStats(slice) });
 }
 
-fn logStepStats(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    step_index: usize,
-    comptime label_fmt: []const u8,
-    buffer: zml.Buffer,
-) !void {
-    const label = try std.fmt.allocPrint(allocator, label_fmt, .{step_index});
-    defer allocator.free(label);
-    try logBufferStats(allocator, io, label, buffer);
-}
-
 fn compileTextEncoderExe(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -299,79 +301,46 @@ fn compileTransformerExe(
     );
 }
 
-fn createPromptInputs(
+fn generateLatents(latent_shape: zml.Shape) zml.Tensor {
+    return zml.Tensor.Rng.normal(latent_shape, .{});
+}
+
+fn compileLatentGeneratorExe(
     allocator: std.mem.Allocator,
     io: std.Io,
     platform: *const zml.Platform,
-    tokenizer: *const zimage_tokenizer.Tokenizer,
-    prompt_seqlen: u32,
-    prompt_text: []const u8,
+    latent_channels: u32,
+    params: CompilationParameters,
+    shardings: []const zml.Sharding,
+) !zml.Exe {
+    const latent_shape = zml.Shape.init(.{
+        .c = latent_channels,
+        .f = params.latent_frames,
+        .h = params.latent_height,
+        .w = params.latent_width,
+    }, .f32);
+
+    return platform.compileFn(
+        allocator,
+        io,
+        generateLatents,
+        .{latent_shape},
+        .{ .shardings = shardings },
+    );
+}
+
+fn uploadPromptInputs(
+    io: std.Io,
+    platform: *const zml.Platform,
+    encoding: *const zimage_tokenizer.PromptEncoding,
 ) !PromptInputs {
-    const rendered_prompt = try tokenizer.applyUserChatTemplateAlloc(allocator, prompt_text);
-    defer allocator.free(rendered_prompt);
-
-    var encoder = try tokenizer.encoder();
-    defer encoder.deinit();
-
-    const prompt_tokens = try encoder.encodeAlloc(allocator, rendered_prompt);
-    defer allocator.free(prompt_tokens);
-
-    if (prompt_tokens.len > prompt_seqlen) return InferenceErrors.PromptTooLong;
-
-    const token_shape = zml.Shape.init(.{ .b = 1, .s = prompt_seqlen }, .u32);
-    var token_slice = try zml.Slice.alloc(allocator, token_shape);
-    defer token_slice.free(allocator);
-    const token_items = token_slice.items(u32);
-    @memset(token_items, tokenizer.padTokenId() orelse 0);
-    @memcpy(token_items[0..prompt_tokens.len], prompt_tokens);
-
-    const mask_shape = zml.Shape.init(.{ .b = 1, .s = prompt_seqlen }, .bool);
-    var mask_slice = try zml.Slice.alloc(allocator, mask_shape);
-    defer mask_slice.free(allocator);
-    const mask_items = mask_slice.items(bool);
-    @memset(mask_items, false);
-    @memset(mask_items[0..prompt_tokens.len], true);
-
-    var ids = try zml.Buffer.fromSlice(io, platform, token_slice, .replicated);
+    var ids = try zml.Buffer.fromSlice(io, platform, encoding.ids, .replicated);
     errdefer ids.deinit();
-    const mask = try zml.Buffer.fromSlice(io, platform, mask_slice, .replicated);
+    const mask = try zml.Buffer.fromSlice(io, platform, encoding.mask, .replicated);
 
     return .{
         .ids = ids,
         .mask = mask,
-        .used_tokens = @intCast(prompt_tokens.len),
-    };
-}
-
-fn extractPromptEmbeds(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    platform: *const zml.Platform,
-    encoded: zml.Buffer,
-    used_tokens: u32,
-) !EncodedPrompt {
-    var src = try encoded.toSliceAlloc(allocator, io);
-    defer src.free(allocator);
-
-    const hidden_size: u32 = @intCast(src.shape.dim(.d));
-    var dst = try zml.Slice.alloc(allocator, zml.Shape.init(.{ .s = used_tokens, .d = hidden_size }, .f32));
-    errdefer dst.free(allocator);
-
-    const src_items = src.constItems(f32);
-    const dst_items = dst.items(f32);
-    const hidden_size_usize: usize = @intCast(hidden_size);
-    const used_tokens_usize: usize = @intCast(used_tokens);
-    for (0..used_tokens_usize) |s| {
-        const src_offset = s * hidden_size_usize;
-        const dst_offset = s * hidden_size_usize;
-        @memcpy(dst_items[dst_offset .. dst_offset + hidden_size_usize], src_items[src_offset .. src_offset + hidden_size_usize]);
-    }
-
-    const embeds = try zml.Buffer.fromSlice(io, platform, dst, .replicated);
-    dst.free(allocator);
-    return .{
-        .embeds = embeds,
-        .seq_len = used_tokens,
     };
 }
 
@@ -383,6 +352,7 @@ fn compileSchedulerStepExe(
     latent_frames: u32,
     latent_height: u32,
     latent_width: u32,
+    model_output_dtype: zml.DataType,
     shardings: []const zml.Sharding,
 ) !zml.Exe {
     const model_output: zml.Tensor = .init(.{
@@ -390,7 +360,7 @@ fn compileSchedulerStepExe(
         .f = latent_frames,
         .h = latent_height,
         .w = latent_width,
-    }, .f32);
+    }, model_output_dtype);
     const sample: zml.Tensor = .init(.{
         .c = latent_channels,
         .f = latent_frames,
@@ -407,6 +377,51 @@ fn compileSchedulerStepExe(
         kernel,
         .step,
         .{ model_output, sample, current_sigma, next_sigma },
+        .{ .shardings = shardings },
+    );
+}
+
+fn compileGuidedSchedulerStepExe(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    platform: *const zml.Platform,
+    latent_channels: u32,
+    latent_frames: u32,
+    latent_height: u32,
+    latent_width: u32,
+    model_output_dtype: zml.DataType,
+    shardings: []const zml.Sharding,
+) !zml.Exe {
+    const model_output_shape = zml.Shape.init(.{
+        .c = latent_channels,
+        .f = latent_frames,
+        .h = latent_height,
+        .w = latent_width,
+    }, model_output_dtype);
+    const sample_shape = model_output_shape.withDtype(.f32);
+    const positive_output: zml.Tensor = .fromShape(model_output_shape);
+    const negative_output: zml.Tensor = .fromShape(model_output_shape);
+    const sample: zml.Tensor = .fromShape(sample_shape);
+    const current_sigma: zml.Tensor = .init(.{}, .f32);
+    const next_sigma: zml.Tensor = .init(.{}, .f32);
+    const guidance_scale: zml.Tensor = .init(.{}, .f32);
+    const normalize: zml.Tensor = .init(.{}, .bool);
+    const kernel: zimage_model.GuidedSchedulerStepKernel = .{};
+
+    return platform.compile(
+        allocator,
+        io,
+        kernel,
+        .step,
+        .{
+            positive_output,
+            negative_output,
+            sample,
+            current_sigma,
+            next_sigma,
+            guidance_scale,
+            normalize,
+        },
         .{ .shardings = shardings },
     );
 }
@@ -438,7 +453,7 @@ fn compileVaeDecodeExe(
     );
 }
 
-pub fn compile_whole_model(
+fn compileExecutables(
     allocator: std.mem.Allocator,
     io: std.Io,
     platform: *const zml.Platform,
@@ -446,93 +461,226 @@ pub fn compile_whole_model(
     params: CompilationParameters,
     progress: *std.Progress.Node,
 ) !CompiledModelResult {
-    log.info("compile_whole_model: entry", .{});
     const now: std.Io.Timestamp = .now(io, .awake);
-    defer log.info("Compiled model [{f}]", .{now.untilNow(io, .awake)});
+    defer log.info("Compiled executables [{f}]", .{now.untilNow(io, .awake)});
 
-    log.info("compile_whole_model: before shardings", .{});
     const all_shardings = params.shardings.all();
-    log.info("compile_whole_model: after shardings", .{});
     const text_encoder = &loaded_model.inner.text_encoder.inner;
-    log.info("compile_whole_model: text encoder ref ready", .{});
     const transformer = &loaded_model.inner.transformer;
-    log.info("compile_whole_model: transformer ref ready", .{});
     const vae = &loaded_model.inner.vae;
-    log.info("compile_whole_model: vae ref ready", .{});
-    progress.increaseEstimatedTotalItems(4);
+    progress.increaseEstimatedTotalItems(6);
 
-    const text_encoder_exe = blk: {
-        var node = progress.start("Compiling text encoder...", 1);
-        defer node.end();
-        log.info("Starting text encoder compile...", .{});
-        const exe = try compileTextEncoderExe(allocator, io, platform, text_encoder, params.prompt_seqlen, &all_shardings);
-        log.info("Finished text encoder compile.", .{});
-        break :blk exe;
-    };
+    var text_encoder_future = try io.concurrent(struct {
+        fn call(
+            allocator_: std.mem.Allocator,
+            io_: std.Io,
+            platform_: *const zml.Platform,
+            text_encoder_: *const zimage_text_encoder.Qwen3ForCausalLM,
+            prompt_seqlen_: u32,
+            shardings_: []const zml.Sharding,
+            progress_: *std.Progress.Node,
+        ) !zml.Exe {
+            var node = progress_.start("Compiling text encoder...", 1);
+            defer node.end();
+
+            const now_: std.Io.Timestamp = .now(io_, .awake);
+            defer log.info("Compiled text encoder [{f}]", .{now_.untilNow(io_, .awake)});
+
+            return compileTextEncoderExe(allocator_, io_, platform_, text_encoder_, prompt_seqlen_, shardings_);
+        }
+    }.call, .{ allocator, io, platform, text_encoder, params.prompt_seqlen, &all_shardings, progress });
+    var text_encoder_future_awaited = false;
+    errdefer if (!text_encoder_future_awaited) if (text_encoder_future.cancel(io)) |exe| exe.deinit() else |_| {};
+
+    var transformer_future = try io.concurrent(struct {
+        fn call(
+            allocator_: std.mem.Allocator,
+            io_: std.Io,
+            platform_: *const zml.Platform,
+            transformer_: *const zimage_transformer.Transformer,
+            params_: CompilationParameters,
+            hidden_size_: u32,
+            shardings_: []const zml.Sharding,
+            progress_: *std.Progress.Node,
+        ) !zml.Exe {
+            var node = progress_.start("Compiling transformer...", 1);
+            defer node.end();
+
+            const now_: std.Io.Timestamp = .now(io_, .awake);
+            defer log.info("Compiled transformer [{f}]", .{now_.untilNow(io_, .awake)});
+
+            return compileTransformerExe(
+                allocator_,
+                io_,
+                platform_,
+                transformer_,
+                params_.prompt_seqlen,
+                params_.latent_frames,
+                params_.latent_height,
+                params_.latent_width,
+                hidden_size_,
+                shardings_,
+            );
+        }
+    }.call, .{ allocator, io, platform, transformer, params, loaded_model.inner.text_encoder.config.hidden_size, &all_shardings, progress });
+    var transformer_future_awaited = false;
+    errdefer if (!transformer_future_awaited) if (transformer_future.cancel(io)) |exe| exe.deinit() else |_| {};
+
+    var latent_generator_future = try io.concurrent(struct {
+        fn call(
+            allocator_: std.mem.Allocator,
+            io_: std.Io,
+            platform_: *const zml.Platform,
+            latent_channels_: u32,
+            params_: CompilationParameters,
+            shardings_: []const zml.Sharding,
+            progress_: *std.Progress.Node,
+        ) !zml.Exe {
+            var node = progress_.start("Compiling latent generator...", 1);
+            defer node.end();
+
+            const now_: std.Io.Timestamp = .now(io_, .awake);
+            defer log.info("Compiled latent generator [{f}]", .{now_.untilNow(io_, .awake)});
+
+            return compileLatentGeneratorExe(
+                allocator_,
+                io_,
+                platform_,
+                latent_channels_,
+                params_,
+                shardings_,
+            );
+        }
+    }.call, .{ allocator, io, platform, transformer.in_channels, params, &all_shardings, progress });
+    var latent_generator_future_awaited = false;
+    errdefer if (!latent_generator_future_awaited) if (latent_generator_future.cancel(io)) |exe| exe.deinit() else |_| {};
+
+    var scheduler_step_future = try io.concurrent(struct {
+        fn call(
+            allocator_: std.mem.Allocator,
+            io_: std.Io,
+            platform_: *const zml.Platform,
+            latent_channels_: u32,
+            params_: CompilationParameters,
+            model_output_dtype_: zml.DataType,
+            shardings_: []const zml.Sharding,
+            progress_: *std.Progress.Node,
+        ) !zml.Exe {
+            var node = progress_.start("Compiling scheduler step...", 1);
+            defer node.end();
+
+            const now_: std.Io.Timestamp = .now(io_, .awake);
+            defer log.info("Compiled scheduler step [{f}]", .{now_.untilNow(io_, .awake)});
+
+            return compileSchedulerStepExe(
+                allocator_,
+                io_,
+                platform_,
+                latent_channels_,
+                params_.latent_frames,
+                params_.latent_height,
+                params_.latent_width,
+                model_output_dtype_,
+                shardings_,
+            );
+        }
+    }.call, .{ allocator, io, platform, vae.config.latent_channels, params, transformer.all_final_layer[0].linear.weight.dtype(), &all_shardings, progress });
+    var scheduler_step_future_awaited = false;
+    errdefer if (!scheduler_step_future_awaited) if (scheduler_step_future.cancel(io)) |exe| exe.deinit() else |_| {};
+
+    var guided_scheduler_step_future = try io.concurrent(struct {
+        fn call(
+            allocator_: std.mem.Allocator,
+            io_: std.Io,
+            platform_: *const zml.Platform,
+            latent_channels_: u32,
+            params_: CompilationParameters,
+            model_output_dtype_: zml.DataType,
+            shardings_: []const zml.Sharding,
+            progress_: *std.Progress.Node,
+        ) !zml.Exe {
+            var node = progress_.start("Compiling guided scheduler step...", 1);
+            defer node.end();
+
+            const now_: std.Io.Timestamp = .now(io_, .awake);
+            defer log.info("Compiled guided scheduler step [{f}]", .{now_.untilNow(io_, .awake)});
+
+            return compileGuidedSchedulerStepExe(
+                allocator_,
+                io_,
+                platform_,
+                latent_channels_,
+                params_.latent_frames,
+                params_.latent_height,
+                params_.latent_width,
+                model_output_dtype_,
+                shardings_,
+            );
+        }
+    }.call, .{ allocator, io, platform, vae.config.latent_channels, params, transformer.all_final_layer[0].linear.weight.dtype(), &all_shardings, progress });
+    var guided_scheduler_step_future_awaited = false;
+    errdefer if (!guided_scheduler_step_future_awaited) if (guided_scheduler_step_future.cancel(io)) |exe| exe.deinit() else |_| {};
+
+    var vae_decode_future = try io.concurrent(struct {
+        fn call(
+            allocator_: std.mem.Allocator,
+            io_: std.Io,
+            platform_: *const zml.Platform,
+            vae_: *const zimage_vae.AutoEncoder,
+            params_: CompilationParameters,
+            shardings_: []const zml.Sharding,
+            progress_: *std.Progress.Node,
+        ) !zml.Exe {
+            var node = progress_.start("Compiling VAE decode...", 1);
+            defer node.end();
+
+            const now_: std.Io.Timestamp = .now(io_, .awake);
+            defer log.info("Compiled VAE decode [{f}]", .{now_.untilNow(io_, .awake)});
+
+            return compileVaeDecodeExe(
+                allocator_,
+                io_,
+                platform_,
+                vae_,
+                params_.latent_frames,
+                params_.latent_height,
+                params_.latent_width,
+                shardings_,
+            );
+        }
+    }.call, .{ allocator, io, platform, vae, params, &all_shardings, progress });
+    var vae_decode_future_awaited = false;
+    errdefer if (!vae_decode_future_awaited) if (vae_decode_future.cancel(io)) |exe| exe.deinit() else |_| {};
+
+    const text_encoder_exe = try text_encoder_future.await(io);
+    text_encoder_future_awaited = true;
     errdefer text_encoder_exe.deinit();
 
-    const transformer_exe = blk: {
-        var node = progress.start("Compiling transformer...", 1);
-        defer node.end();
-        log.info("Starting transformer compile...", .{});
-        const exe = try compileTransformerExe(
-            allocator,
-            io,
-            platform,
-            transformer,
-            params.prompt_seqlen,
-            params.latent_frames,
-            params.latent_height,
-            params.latent_width,
-            loaded_model.inner.text_encoder.config.hidden_size,
-            &all_shardings,
-        );
-        log.info("Finished transformer compile.", .{});
-        break :blk exe;
-    };
+    const transformer_exe = try transformer_future.await(io);
+    transformer_future_awaited = true;
     errdefer transformer_exe.deinit();
 
-    const scheduler_step_exe = blk: {
-        var node = progress.start("Compiling scheduler step...", 1);
-        defer node.end();
-        log.info("Starting scheduler step compile...", .{});
-        const exe = try compileSchedulerStepExe(
-            allocator,
-            io,
-            platform,
-            vae.config.latent_channels,
-            params.latent_frames,
-            params.latent_height,
-            params.latent_width,
-            &all_shardings,
-        );
-        log.info("Finished scheduler step compile.", .{});
-        break :blk exe;
-    };
+    const latent_generator_exe = try latent_generator_future.await(io);
+    latent_generator_future_awaited = true;
+    errdefer latent_generator_exe.deinit();
+
+    const scheduler_step_exe = try scheduler_step_future.await(io);
+    scheduler_step_future_awaited = true;
     errdefer scheduler_step_exe.deinit();
 
-    const vae_decode_exe = blk: {
-        var node = progress.start("Compiling VAE decode...", 1);
-        defer node.end();
-        log.info("Starting VAE decode compile...", .{});
-        const exe = try compileVaeDecodeExe(
-            allocator,
-            io,
-            platform,
-            vae,
-            params.latent_frames,
-            params.latent_height,
-            params.latent_width,
-            &all_shardings,
-        );
-        log.info("Finished VAE decode compile.", .{});
-        break :blk exe;
-    };
+    const guided_scheduler_step_exe = try guided_scheduler_step_future.await(io);
+    guided_scheduler_step_future_awaited = true;
+    errdefer guided_scheduler_step_exe.deinit();
+
+    const vae_decode_exe = try vae_decode_future.await(io);
+    vae_decode_future_awaited = true;
 
     return .{
         .text_encoder = text_encoder_exe,
         .transformer = transformer_exe,
+        .latent_generator = latent_generator_exe,
         .scheduler_step = scheduler_step_exe,
+        .guided_scheduler_step = guided_scheduler_step_exe,
         .vae_decode = vae_decode_exe,
     };
 }
@@ -542,7 +690,7 @@ pub const InferencePipeline = struct {
     io: std.Io,
     platform: *const zml.Platform,
     compiled_model: CompiledModel,
-    model_buffers: *zimage_model.Buffers,
+    model_buffers: zimage_model.Buffers,
     text_tokenizer: zimage_tokenizer.Tokenizer,
     scheduler_state: zimage_scheduler.Scheduler,
 
@@ -559,8 +707,9 @@ pub const InferencePipeline = struct {
         width: u32,
         progress: *std.Progress.Node,
     ) !InferencePipeline {
-        const backend = zml.attention.attention.Backend.auto(platform);
+        const backend = zml.attention.Backend.auto(platform);
 
+        // Compile model and generate its exe's
         var compiled_model = try loaded_model.compile(
             allocator,
             io,
@@ -574,23 +723,22 @@ pub const InferencePipeline = struct {
         );
         errdefer compiled_model.deinit();
 
-        const model_buffers = try allocator.create(zimage_model.Buffers);
-        errdefer allocator.destroy(model_buffers);
-        try loaded_model.loadBuffers(
+        // Load model buffers after the model compilation
+        var model_buffers = try loaded_model.loadBuffers(
             allocator,
             io,
             platform,
             store,
             progress,
             shardings,
-            model_buffers,
         );
-        errdefer loaded_model.unloadBuffers(model_buffers, allocator);
+        errdefer loaded_model.unloadBuffers(&model_buffers, allocator);
 
         var text_tokenizer = try zimage_tokenizer.Tokenizer.fromDir(
             allocator,
             io,
             repo,
+            common.repositoryFiles(.zimage),
             .{},
         );
         errdefer text_tokenizer.deinit();
@@ -613,11 +761,67 @@ pub const InferencePipeline = struct {
     }
 
     pub fn deinit(self: *InferencePipeline, allocator: std.mem.Allocator) void {
-        self.compiled_model.loaded_model.unloadBuffers(self.model_buffers, allocator);
-        allocator.destroy(self.model_buffers);
+        self.compiled_model.loaded_model.unloadBuffers(&self.model_buffers, allocator);
         self.compiled_model.deinit();
         self.text_tokenizer.deinit();
         self.scheduler_state.deinit(allocator);
+    }
+
+    fn encodePrompt(
+        self: *InferencePipeline,
+        prompt: []const u8,
+        negative_prompt: []const u8,
+        do_classifier_free_guidance: bool,
+    ) !EncodedPrompts {
+        var positive = try self.encodePromptItem(prompt, "prompt embeddings");
+        errdefer positive.deinit();
+
+        const negative = if (do_classifier_free_guidance)
+            try self.encodePromptItem(negative_prompt, "negative prompt embeddings")
+        else
+            null;
+
+        return .{
+            .positive = positive,
+            .negative = negative,
+        };
+    }
+
+    fn encodePromptItem(
+        self: *InferencePipeline,
+        prompt: []const u8,
+        log_label: []const u8,
+    ) !EncodedPrompt {
+        var prompt_encoding = try self.text_tokenizer.encodePromptAlloc(
+            self.allocator,
+            prompt,
+            self.compiled_model.params.prompt_seqlen,
+        );
+        defer prompt_encoding.deinit(self.allocator);
+
+        var prompt_inputs = try uploadPromptInputs(self.io, self.platform, &prompt_encoding);
+        defer prompt_inputs.deinit();
+
+        var text_encoder_args = try self.compiled_model.text_encoder.args(self.allocator);
+        defer text_encoder_args.deinit(self.allocator);
+        var text_encoder_results = try self.compiled_model.text_encoder.results(self.allocator);
+        defer text_encoder_results.deinit(self.allocator);
+
+        text_encoder_args.set(.{
+            &self.model_buffers.text_encoder.inner,
+            prompt_inputs.ids,
+            prompt_inputs.mask,
+        });
+        self.compiled_model.text_encoder.call(text_encoder_args, &text_encoder_results);
+
+        // Keep the padded sequence length expected by the precompiled transformer.
+        var prompt_embeds: EncodedPrompt = .{
+            .embeds = text_encoder_results.get(zml.Buffer),
+        };
+        errdefer prompt_embeds.deinit();
+
+        try logBufferStats(self.allocator, self.io, log_label, prompt_embeds.embeds);
+        return prompt_embeds;
     }
 
     pub fn run(self: *InferencePipeline, opts: RunOptions) !void {
@@ -632,129 +836,30 @@ pub const InferencePipeline = struct {
             return InferenceErrors.InvalidImageSize;
         }
 
-        var prompt_inputs = try createPromptInputs(
-            self.allocator,
-            self.io,
-            self.platform,
-            &self.text_tokenizer,
-            self.compiled_model.params.prompt_seqlen,
+        var prompt_embeds = try self.encodePrompt(
             opts.prompt,
-        );
-        defer prompt_inputs.deinit();
-
-        var text_encoder_args = try self.compiled_model.text_encoder.args(self.allocator);
-        defer text_encoder_args.deinit(self.allocator);
-        var text_encoder_results = try self.compiled_model.text_encoder.results(self.allocator);
-        defer text_encoder_results.deinit(self.allocator);
-
-        text_encoder_args.set(.{ &self.model_buffers.text_encoder.inner, prompt_inputs.ids, prompt_inputs.mask });
-        self.compiled_model.text_encoder.call(text_encoder_args, &text_encoder_results);
-
-        var prompt_embeds_full = text_encoder_results.get(zml.Buffer);
-        defer prompt_embeds_full.deinit();
-
-        var prompt_embeds = try extractPromptEmbeds(
-            self.allocator,
-            self.io,
-            self.platform,
-            prompt_embeds_full,
-            prompt_inputs.used_tokens,
+            if (opts.negative_prompt.len == 0) "" else opts.negative_prompt,
+            do_cfg,
         );
         defer prompt_embeds.deinit();
-        try logBufferStats(self.allocator, self.io, "prompt embeddings", prompt_embeds.embeds);
 
-        var negative_prompt_embeds: ?EncodedPrompt = null;
-        defer if (negative_prompt_embeds) |*encoded| encoded.deinit();
+        const transformer_exe = &self.compiled_model.transformer;
 
-        if (do_cfg) {
-            var negative_prompt_inputs = try createPromptInputs(
-                self.allocator,
-                self.io,
-                self.platform,
-                &self.text_tokenizer,
-                self.compiled_model.params.prompt_seqlen,
-                if (opts.negative_prompt.len == 0) "" else opts.negative_prompt,
-            );
-            defer negative_prompt_inputs.deinit();
+        // Prepare latents
+        var latent_generator_args = try self.compiled_model.latent_generator.args(self.allocator);
+        defer latent_generator_args.deinit(self.allocator);
+        var latent_generator_results = try self.compiled_model.latent_generator.results(self.allocator);
+        defer latent_generator_results.deinit(self.allocator);
 
-            var negative_text_encoder_args = try self.compiled_model.text_encoder.args(self.allocator);
-            defer negative_text_encoder_args.deinit(self.allocator);
-            var negative_text_encoder_results = try self.compiled_model.text_encoder.results(self.allocator);
-            defer negative_text_encoder_results.deinit(self.allocator);
-
-            negative_text_encoder_args.set(.{
-                &self.model_buffers.text_encoder.inner,
-                negative_prompt_inputs.ids,
-                negative_prompt_inputs.mask,
-            });
-            self.compiled_model.text_encoder.call(negative_text_encoder_args, &negative_text_encoder_results);
-
-            var negative_prompt_embeds_full = negative_text_encoder_results.get(zml.Buffer);
-            defer negative_prompt_embeds_full.deinit();
-
-            negative_prompt_embeds = try extractPromptEmbeds(
-                self.allocator,
-                self.io,
-                self.platform,
-                negative_prompt_embeds_full,
-                negative_prompt_inputs.used_tokens,
-            );
-            try logBufferStats(self.allocator, self.io, "negative prompt embeddings", negative_prompt_embeds.?.embeds);
-        }
-
-        const all_shardings = self.compiled_model.params.shardings.all();
-        var transformer_exe = try compileTransformerExe(
-            self.allocator,
-            self.io,
-            self.platform,
-            &self.compiled_model.loaded_model.inner.transformer,
-            prompt_embeds.seq_len,
-            self.compiled_model.params.latent_frames,
-            self.compiled_model.params.latent_height,
-            self.compiled_model.params.latent_width,
-            self.compiled_model.loaded_model.inner.text_encoder.config.hidden_size,
-            &all_shardings,
-        );
-        defer transformer_exe.deinit();
-
-        var negative_transformer_exe: ?zml.Exe = null;
-        defer if (negative_transformer_exe) |*exe| exe.deinit();
-        if (negative_prompt_embeds) |negative_encoded| {
-            if (negative_encoded.seq_len != prompt_embeds.seq_len) {
-                negative_transformer_exe = try compileTransformerExe(
-                    self.allocator,
-                    self.io,
-                    self.platform,
-                    &self.compiled_model.loaded_model.inner.transformer,
-                    negative_encoded.seq_len,
-                    self.compiled_model.params.latent_frames,
-                    self.compiled_model.params.latent_height,
-                    self.compiled_model.params.latent_width,
-                    self.compiled_model.loaded_model.inner.text_encoder.config.hidden_size,
-                    &all_shardings,
-                );
-            }
-        }
-
-        const latent_shape = zml.Shape.init(.{
-            .c = self.compiled_model.loaded_model.inner.transformer.in_channels,
-            .f = self.compiled_model.params.latent_frames,
-            .h = self.compiled_model.params.latent_height,
-            .w = self.compiled_model.params.latent_width,
-        }, .f32);
-        var latent_slice = try zml.Slice.alloc(self.allocator, latent_shape);
-        defer latent_slice.free(self.allocator);
-        var prng = std.Random.DefaultPrng.init(opts.seed);
-        const random = prng.random();
-        for (latent_slice.items(f32)) |*value| {
-            value.* = random.floatNorm(f32);
-        }
-
-        var latents = try zml.Buffer.fromSlice(self.io, self.platform, latent_slice, .replicated);
+        // Generate latents
+        self.compiled_model.latent_generator.call(latent_generator_args, &latent_generator_results);
+        var latents = latent_generator_results.get(zml.Buffer);
         defer latents.deinit();
         try logBufferStats(self.allocator, self.io, "initial latents", latents);
 
         const image_seq_len = (self.compiled_model.params.latent_height / 2) * (self.compiled_model.params.latent_width / 2);
+
+        // Prepare timesteps
         const mu: ?f32 = if (self.scheduler_state.use_dynamic_shifting) blk: {
             const base_seq_len = @as(f32, @floatFromInt(self.scheduler_state.base_image_seq_len));
             const max_seq_len = @as(f32, @floatFromInt(self.scheduler_state.max_image_seq_len));
@@ -766,8 +871,19 @@ pub const InferencePipeline = struct {
         } else null;
         try self.scheduler_state.setTimesteps(self.allocator, opts.num_inference_steps, mu);
 
-        for (self.scheduler_state.timesteps) |raw_timestep| {
-            const step_index = self.scheduler_state.step_index orelse 0;
+        // Denoising loop
+        for (self.scheduler_state.timesteps, 0..) |raw_timestep, step_index| {
+            const step_number = step_index + 1;
+            const step_started: std.Io.Timestamp = .now(self.io, .awake);
+            log.info(
+                "Denoising step {d}/{d}{s}...",
+                .{
+                    step_number,
+                    self.scheduler_state.timesteps.len,
+                    if (do_cfg) " (CFG: 2 transformer calls)" else "",
+                },
+            );
+
             const normalized_timestep = (1000.0 - raw_timestep) / 1000.0;
             const timestep_values = [_]f32{normalized_timestep};
             var timestep_buffer = try zml.Buffer.fromBytes(
@@ -784,85 +900,45 @@ pub const InferencePipeline = struct {
             var transformer_results = try transformer_exe.results(self.allocator);
             defer transformer_results.deinit(self.allocator);
 
-            transformer_args.set(.{ &self.model_buffers.transformer, latents, timestep_buffer, prompt_embeds.embeds });
+            transformer_args.set(.{ &self.model_buffers.transformer, latents, timestep_buffer, prompt_embeds.positive.embeds });
             transformer_exe.call(transformer_args, &transformer_results);
 
-            var noise_pred = transformer_results.get(zml.Buffer);
-            try logStepStats(self.allocator, self.io, step_index, "step {d} transformer output", noise_pred);
-            var scheduler_input = noise_pred;
+            var positive_output = transformer_results.get(zml.Buffer);
+            defer positive_output.deinit();
 
-            if (do_cfg) {
-                const negative_transformer_ref = if (negative_transformer_exe) |*exe| exe else &transformer_exe;
-                var negative_transformer_args = try negative_transformer_ref.args(self.allocator);
+            const next_latents = if (do_cfg) blk: {
+                var negative_transformer_args = try transformer_exe.args(self.allocator);
                 defer negative_transformer_args.deinit(self.allocator);
-                var negative_transformer_results = try negative_transformer_ref.results(self.allocator);
+                var negative_transformer_results = try transformer_exe.results(self.allocator);
                 defer negative_transformer_results.deinit(self.allocator);
 
                 negative_transformer_args.set(.{
                     &self.model_buffers.transformer,
                     latents,
                     timestep_buffer,
-                    negative_prompt_embeds.?.embeds,
+                    prompt_embeds.negative.?.embeds,
                 });
-                negative_transformer_ref.call(negative_transformer_args, &negative_transformer_results);
+                transformer_exe.call(negative_transformer_args, &negative_transformer_results);
 
-                var negative_noise_pred = negative_transformer_results.get(zml.Buffer);
-                defer negative_noise_pred.deinit();
-                try logStepStats(self.allocator, self.io, step_index, "step {d} negative transformer output", negative_noise_pred);
+                var negative_output = negative_transformer_results.get(zml.Buffer);
+                defer negative_output.deinit();
 
-                var positive_f32 = try bufferToF32(self.allocator, self.io, self.platform, noise_pred);
-                defer if (positive_f32.owned) positive_f32.buffer.deinit();
-                var negative_f32 = try bufferToF32(self.allocator, self.io, self.platform, negative_noise_pred);
-                defer if (negative_f32.owned) negative_f32.buffer.deinit();
-
-                var positive_slice = try positive_f32.buffer.toSliceAlloc(self.allocator, self.io);
-                defer positive_slice.free(self.allocator);
-                var negative_slice = try negative_f32.buffer.toSliceAlloc(self.allocator, self.io);
-                defer negative_slice.free(self.allocator);
-
-                var positive_norm: f64 = 0.0;
-                var pred_norm: f64 = 0.0;
-                const positive_items = positive_slice.items(f32);
-                const negative_items = negative_slice.constItems(f32);
-                for (positive_items, negative_items) |*positive, negative| {
-                    const pos = positive.*;
-                    const pred = -(pos + opts.guidance_scale * (pos - negative));
-                    positive.* = pred;
-                    positive_norm += @as(f64, pos) * @as(f64, pos);
-                    pred_norm += @as(f64, pred) * @as(f64, pred);
-                }
-
-                if (opts.cfg_normalization and pred_norm > 0.0) {
-                    const max_new_norm = std.math.sqrt(positive_norm);
-                    const actual_new_norm = std.math.sqrt(pred_norm);
-                    if (actual_new_norm > max_new_norm) {
-                        const scale = @as(f32, @floatCast(max_new_norm / actual_new_norm));
-                        for (positive_items) |*value| {
-                            value.* *= scale;
-                        }
-                    }
-                }
-
-                scheduler_input = try zml.Buffer.fromSlice(self.io, self.platform, positive_slice, .replicated);
-                noise_pred.deinit();
-            } else {
-                var noise_slice = try noise_pred.toSliceAlloc(self.allocator, self.io);
-                defer noise_slice.free(self.allocator);
-                for (noise_slice.items(f32)) |*value| {
-                    value.* = -value.*;
-                }
-
-                scheduler_input = try zml.Buffer.fromSlice(self.io, self.platform, noise_slice, .replicated);
-                noise_pred.deinit();
-            }
-
-            try logStepStats(self.allocator, self.io, step_index, "step {d} scheduler input", scheduler_input);
-            defer scheduler_input.deinit();
-            const next_latents = try self.runSchedulerStep(scheduler_input, latents, raw_timestep);
-            try logStepStats(self.allocator, self.io, step_index, "step {d} scheduler output latents", next_latents);
+                break :blk try self.runGuidedSchedulerStep(
+                    positive_output,
+                    negative_output,
+                    latents,
+                    raw_timestep,
+                    opts.guidance_scale,
+                    opts.cfg_normalization,
+                );
+            } else try self.runSchedulerStep(positive_output, latents, raw_timestep);
 
             latents.deinit();
             latents = next_latents;
+            log.info(
+                "Denoising step {d}/{d} [{f}]",
+                .{ step_number, self.scheduler_state.timesteps.len, step_started.untilNow(self.io, .awake) },
+            );
         }
 
         var scaled_latent_slice = try latents.toSliceAlloc(self.allocator, self.io);
@@ -940,12 +1016,6 @@ pub const InferencePipeline = struct {
     ) !zml.Buffer {
         const sigmas = self.scheduler_state.nextStepSigmas(timestep);
 
-        var scheduler_noise_pred = try bufferToF32(self.allocator, self.io, self.platform, noise_pred);
-        defer if (scheduler_noise_pred.owned) scheduler_noise_pred.buffer.deinit();
-
-        var scheduler_latents = try bufferToF32(self.allocator, self.io, self.platform, latents);
-        defer if (scheduler_latents.owned) scheduler_latents.buffer.deinit();
-
         var current_sigma_buf = try zml.Buffer.scalar(self.io, self.platform, sigmas.current, .f32);
         defer current_sigma_buf.deinit();
 
@@ -959,12 +1029,55 @@ pub const InferencePipeline = struct {
         defer scheduler_results.deinit(self.allocator);
 
         scheduler_args.set(.{
-            scheduler_noise_pred.buffer,
-            scheduler_latents.buffer,
+            noise_pred,
+            latents,
             current_sigma_buf,
             next_sigma_buf,
         });
         self.compiled_model.scheduler_step.call(scheduler_args, &scheduler_results);
+
+        return scheduler_results.get(zml.Buffer);
+    }
+
+    fn runGuidedSchedulerStep(
+        self: *InferencePipeline,
+        positive_output: zml.Buffer,
+        negative_output: zml.Buffer,
+        latents: zml.Buffer,
+        timestep: f32,
+        guidance_scale: f32,
+        normalize: bool,
+    ) !zml.Buffer {
+        const sigmas = self.scheduler_state.nextStepSigmas(timestep);
+
+        var current_sigma_buf = try zml.Buffer.scalar(self.io, self.platform, sigmas.current, .f32);
+        defer current_sigma_buf.deinit();
+
+        var next_sigma_buf = try zml.Buffer.scalar(self.io, self.platform, sigmas.next, .f32);
+        defer next_sigma_buf.deinit();
+
+        var guidance_scale_buf = try zml.Buffer.scalar(self.io, self.platform, guidance_scale, .f32);
+        defer guidance_scale_buf.deinit();
+
+        var normalize_buf = try zml.Buffer.scalar(self.io, self.platform, normalize, .bool);
+        defer normalize_buf.deinit();
+
+        var scheduler_args = try self.compiled_model.guided_scheduler_step.args(self.allocator);
+        defer scheduler_args.deinit(self.allocator);
+
+        var scheduler_results = try self.compiled_model.guided_scheduler_step.results(self.allocator);
+        defer scheduler_results.deinit(self.allocator);
+
+        scheduler_args.set(.{
+            positive_output,
+            negative_output,
+            latents,
+            current_sigma_buf,
+            next_sigma_buf,
+            guidance_scale_buf,
+            normalize_buf,
+        });
+        self.compiled_model.guided_scheduler_step.call(scheduler_args, &scheduler_results);
 
         return scheduler_results.get(zml.Buffer);
     }

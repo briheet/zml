@@ -2,7 +2,8 @@
   pkgs,
   config,
   ...
-}: {
+}:
+{
   packages = with pkgs; [
     bazelisk
     python3

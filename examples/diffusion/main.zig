@@ -14,10 +14,6 @@ pub const std_options: std.Options = .{
 
 const log = std.log.scoped(.diffusion);
 
-// comptime {
-//     _ = models;
-// }
-
 const Args = struct {
     model: []const u8,
     prompt: ?[]const u8 = null,
@@ -29,30 +25,36 @@ const Args = struct {
     seqlen: u32 = 512,
     steps: u32 = 50,
     output: []const u8 = "zimage.png",
-    seed: u64 = 0,
-};
 
-const GenerationOptions = struct {
-    steps: u32,
-    output: []const u8,
-    seed: u64,
+    pub const help =
+        \\ Use diffusion --model_path [options]
+        \\
+        \\ Runs image generation with a model selected from `model_type` in the `config.toml`.
+        \\
+        \\ Options:
+        \\   --model=<path>              Path to the model repository (required)
+        \\   --prompt=<string>           Runs a single prompt for image generation (required)
+        \\   --negative-prompt=<string>  Negative prompt used for classifier-free guidance (optional)
+        \\   --guidance_scale=<float>    Classifier free guidance scale (optional)
+        \\   --cfg-normalization         Caps the guided prediction norm to the positive prediction norm (optional)
+        \\   --height=<pixel>            Output dimension. Should be divisible by 16. Defaults to 1024 (optional)
+        \\   --width=<pixel>             Output dimension. Should be divisible by 16. Defaults to 1024 (optional)
+        \\   --steps=<count>             Number of denoising steps. Defaults to 50. (optional)
+        \\   --seqlen=<number>           Maximum tokenization prompt len. Defaults to 512. (optional)
+        \\   --output=<path>             Image output path. Defaults to `zimage.png`. (optional)
+    ;
 };
 
 fn loadTensorRegistry(
     allocator: std.mem.Allocator,
     io: std.Io,
     repo: std.Io.Dir,
+    files: models.RepositoryFiles,
 ) !zml.safetensors.TensorRegistry {
     var registry = zml.safetensors.TensorRegistry.init(allocator);
     errdefer registry.deinit();
 
-    const entrypoints = [_][]const u8{
-        "text_encoder/model.safetensors.index.json",
-        "transformer/diffusion_pytorch_model.safetensors.index.json",
-        "vae/diffusion_pytorch_model.safetensors",
-    };
-
-    for (entrypoints) |path| {
+    for (files.tensor_entrypoints) |path| {
         const component_dir_path = std.fs.path.dirname(path) orelse ".";
         const entrypoint_name = std.fs.path.basename(path);
         const component_name = std.fs.path.dirname(path) orelse unreachable;
@@ -144,15 +146,27 @@ pub fn main(init: std.process.Init) !void {
     const repo = try zml.safetensors.resolveModelRepo(io, args.model);
 
     log.info("Initializing model..", .{});
-    var registry = try loadTensorRegistry(allocator, io, repo);
+    const model_type = try models.detectModelType(allocator, io, repo);
+    const repository_files = models.repositoryFiles(model_type);
+
+    var registry = try loadTensorRegistry(allocator, io, repo, repository_files);
     defer registry.deinit();
 
     var store: zml.io.TensorStore = .fromRegistry(allocator, &registry);
     defer store.deinit();
 
-    var model = try models.LoadedModel.load(allocator, io, repo, store.view());
-    defer model.deinit(allocator);
+    // Load model
+    const model = try allocator.create(models.LoadedModel);
+    model.* = models.LoadedModel.load(allocator, io, repo, store.view(), model_type) catch |err| {
+        allocator.destroy(model);
+        return err;
+    };
+    defer {
+        model.deinit(allocator);
+        allocator.destroy(model);
+    }
 
+    // Defines how the model's tensors are sharded across the available devices.
     const shardings: models.Shardings = try .init(platform);
 
     //
@@ -161,8 +175,8 @@ pub fn main(init: std.process.Init) !void {
     var progress = std.Progress.start(io, .{ .root_name = args.model });
     errdefer progress.end();
 
-    var inference_pipeline = switch (model) {
-        .zimage => |zimage_loaded_model| try models.pipeline.init(
+    var inference_pipeline = switch (model.*) {
+        .zimage => |*zimage_loaded_model| try models.pipeline.init(
             allocator,
             io,
             repo,
@@ -180,6 +194,9 @@ pub fn main(init: std.process.Init) !void {
 
     progress.end();
 
+    try printZmlLogo(io);
+
+    const generation_started: std.Io.Timestamp = .now(io, .awake);
     try inference_pipeline.run(.{
         .prompt = args.prompt orelse return models.InferenceErrors.MissingPrompt,
         .negative_prompt = args.negative_prompt,
@@ -188,9 +205,9 @@ pub fn main(init: std.process.Init) !void {
         .cfg_normalization = args.cfg_normalization,
         .height = args.height,
         .width = args.width,
-        .seed = args.seed,
         .output_path = args.output,
     });
+    log.info("Generated image [{f}]", .{generation_started.untilNow(io, .awake)});
 }
 
 pub fn printZmlLogo(io: std.Io) !void {

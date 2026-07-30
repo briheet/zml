@@ -1,4 +1,5 @@
-load("@rules_zig//zig:defs.bzl", "zig_binary", "zig_test")
+load("@rules_zig//zig:defs.bzl", "zig_binary")
+load("@bazel_skylib//rules:build_test.bzl", "build_test")
 
 zig_binary(
     name = "diffusion",
@@ -11,14 +12,7 @@ zig_binary(
     ],
 )
 
-zig_test(
-    name = "scheduler_test",
-    main = "models/zimage/scheduler.zig",
-    deps = ["//zml"],
-)
-
-zig_test(
-    name = "text_encoder_test",
-    main = "models/zimage/text_encoder.zig",
-    deps = ["//zml"],
+build_test(
+    name = "test",
+    targets = [":diffusion"],
 )

@@ -1,13 +1,11 @@
 # Diffusion
 
 `//examples/diffusion` runs one shot image generation from a model repository.
-These models are generally found on huggingface where the provider downloads the model weights.
+We support the following models, automatically detected from the model_type in the config.json:
 
 Currently supported models:
 
 - Tongyi-MAI/Z-Image
-
-For a complete CUDA setup on RunPod, see [RUNPOD.md](./RUNPOD.md).
 
 ## Run
 
@@ -15,19 +13,23 @@ To load a model from HuggingFace directly:
 
 ```bash
 # CPU
-bazel run //examples/diffusion -- --model=hf://Tongyi-MAI/Z-Image --prompt="A tesla cybertruck on Mars"
+bazel run //examples/diffusion -- --model=hf://Tongyi-MAI/Z-Image
 # CUDA
 bazel run //examples/diffusion --@zml//platforms:cuda=true -- --model=hf://Tongyi-MAI/Z-Image
 # ROCm
 bazel run //examples/diffusion --@zml//platforms:rocm=true -- --model=hf://Tongyi-MAI/Z-Image
 ```
 
-From a local directory
+From a local directory:
 
 ```bash
-bazel run //examples/diffusion --@zml//platforms:cuda=true -- \
-  --model=/var/models/Tongyi-MAI/Z-Image \
-  --prompt="A tesla cybertruck on Mars"
+bazel run //examples/diffusion --@zml//platforms:cuda=true -- --model=/var/models/Tongyi-MAI/Z-Image
+```
+
+From a single non-interative prompt:
+
+```bash
+bazel run //examples/diffusion --@zml//platforms:cuda=true -- --model=hf://Tongyi-MAI/Z-Image --prompt="A cute cat under the tree"
 ```
 
 ## Options
@@ -40,5 +42,4 @@ bazel run //examples/diffusion --@zml//platforms:cuda=true -- \
 - `--height=<pixels>` and `--width=<pixels>`: Output dimensions, each divisible by 16. Both default to `1024`.
 - `--steps=<count>`: Number of denoising steps. Defaults to `50`.
 - `--seqlen=<count>`: Maximum tokenized prompt length. Defaults to `512`.
-- `--seed=<integer>`: Random seed. Defaults to `0`.
 - `--output=<path>`: PNG output path. Defaults to `zimage.png`.

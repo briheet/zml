@@ -57,10 +57,15 @@ pub const AutoEncoder = struct {
     tile_overlap_factor: f32,
 
     pub fn init(store: zml.io.TensorStore.View, config: Config) !AutoEncoder {
+        var encoder = try Encoder.init(store.withPrefix("encoder"), config);
+        errdefer encoder.deinit();
+        var decoder = try Decoder.init(store.withPrefix("decoder"), config);
+        errdefer decoder.deinit();
+
         return .{
             .config = config,
-            .encoder = try Encoder.init(store.withPrefix("encoder"), config),
-            .decoder = try Decoder.init(store.withPrefix("decoder"), config),
+            .encoder = encoder,
+            .decoder = decoder,
             .quant_conv = if (config.use_quant_conv)
                 Conv2d.init(
                     store.withPrefix("quant_conv"),
@@ -91,14 +96,14 @@ pub const AutoEncoder = struct {
         };
     }
 
-    pub fn unloadBuffers(self: *zml.Bufferized(AutoEncoder)) void {
-        Encoder.unloadBuffers(&self.encoder);
-        Decoder.unloadBuffers(&self.decoder);
+    pub fn unloadBuffers(self: *zml.Bufferized(AutoEncoder), allocator: std.mem.Allocator) void {
+        Encoder.unloadBuffers(&self.encoder, allocator);
+        Decoder.unloadBuffers(&self.decoder, allocator);
         if (self.quant_conv) |*conv| Conv2d.unloadBuffers(conv);
         if (self.post_quant_conv) |*conv| Conv2d.unloadBuffers(conv);
     }
 
-    pub fn deinit(self: AutoEncoder, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *AutoEncoder, allocator: std.mem.Allocator) void {
         _ = allocator;
         self.encoder.deinit();
         self.decoder.deinit();
@@ -151,6 +156,8 @@ pub const AutoEncoder = struct {
         pub fn init(store: zml.io.TensorStore.View, config: Config) !Encoder {
             const down_blocks = try std.heap.page_allocator.alloc(DownEncoderBlock2D, config.block_out_channels.len);
             errdefer std.heap.page_allocator.free(down_blocks);
+            var initialized_blocks: usize = 0;
+            errdefer for (down_blocks[0..initialized_blocks]) |*block| block.deinit();
 
             var output_channel = config.block_out_channels[0];
             for (config.down_block_types, config.block_out_channels, 0..) |down_block_type, block_out, i| {
@@ -167,19 +174,23 @@ pub const AutoEncoder = struct {
                     config.act_fn,
                     config.norm_num_groups,
                 );
+                initialized_blocks += 1;
             }
+
+            var mid_block = try UNetMidBlock2D.init(
+                store.withPrefix("mid_block"),
+                config.block_out_channels[config.block_out_channels.len - 1],
+                config.act_fn,
+                config.norm_num_groups,
+                config.mid_block_add_attention,
+            );
+            errdefer mid_block.deinit();
 
             return .{
                 .layers_per_block = config.layers_per_block,
                 .conv_in = Conv2d.init(store.withPrefix("conv_in"), config.in_channels, config.block_out_channels[0], 3, 1, 1),
                 .down_blocks = down_blocks,
-                .mid_block = try UNetMidBlock2D.init(
-                    store.withPrefix("mid_block"),
-                    config.block_out_channels[config.block_out_channels.len - 1],
-                    config.act_fn,
-                    config.norm_num_groups,
-                    config.mid_block_add_attention,
-                ),
+                .mid_block = mid_block,
                 .conv_norm_out = GroupNorm.init(
                     store.withPrefix("conv_norm_out"),
                     config.block_out_channels[config.block_out_channels.len - 1],
@@ -199,16 +210,19 @@ pub const AutoEncoder = struct {
             };
         }
 
-        pub fn deinit(self: Encoder) void {
+        pub fn deinit(self: *Encoder) void {
+            for (self.down_blocks) |*block| block.deinit();
+            self.mid_block.deinit();
             std.heap.page_allocator.free(self.down_blocks);
         }
 
-        pub fn unloadBuffers(self: *zml.Bufferized(Encoder)) void {
+        pub fn unloadBuffers(self: *zml.Bufferized(Encoder), allocator: std.mem.Allocator) void {
             Conv2d.unloadBuffers(&self.conv_in);
-            for (self.down_blocks) |*block| DownEncoderBlock2D.unloadBuffers(block);
-            UNetMidBlock2D.unloadBuffers(&self.mid_block);
+            for (self.down_blocks) |*block| DownEncoderBlock2D.unloadBuffers(block, allocator);
+            UNetMidBlock2D.unloadBuffers(&self.mid_block, allocator);
             GroupNorm.unloadBuffers(&self.conv_norm_out);
             Conv2d.unloadBuffers(&self.conv_out);
+            allocator.free(self.down_blocks);
         }
 
         pub fn forward(self: Encoder, sample: zml.Tensor) zml.Tensor {
@@ -237,6 +251,8 @@ pub const AutoEncoder = struct {
         pub fn init(store: zml.io.TensorStore.View, config: Config) !Decoder {
             const up_blocks = try std.heap.page_allocator.alloc(UpDecoderBlock2D, config.block_out_channels.len);
             errdefer std.heap.page_allocator.free(up_blocks);
+            var initialized_blocks: usize = 0;
+            errdefer for (up_blocks[0..initialized_blocks]) |*block| block.deinit();
 
             const reversed = [_]u32{
                 config.block_out_channels[3],
@@ -260,7 +276,17 @@ pub const AutoEncoder = struct {
                     config.act_fn,
                     config.norm_num_groups,
                 );
+                initialized_blocks += 1;
             }
+
+            var mid_block = try UNetMidBlock2D.init(
+                store.withPrefix("mid_block"),
+                config.block_out_channels[config.block_out_channels.len - 1],
+                config.act_fn,
+                config.norm_num_groups,
+                config.mid_block_add_attention,
+            );
+            errdefer mid_block.deinit();
 
             return .{
                 .layers_per_block = config.layers_per_block,
@@ -272,13 +298,7 @@ pub const AutoEncoder = struct {
                     1,
                     1,
                 ),
-                .mid_block = try UNetMidBlock2D.init(
-                    store.withPrefix("mid_block"),
-                    config.block_out_channels[config.block_out_channels.len - 1],
-                    config.act_fn,
-                    config.norm_num_groups,
-                    config.mid_block_add_attention,
-                ),
+                .mid_block = mid_block,
                 .up_blocks = up_blocks,
                 .conv_norm_out = GroupNorm.init(
                     store.withPrefix("conv_norm_out"),
@@ -299,16 +319,19 @@ pub const AutoEncoder = struct {
             };
         }
 
-        pub fn deinit(self: Decoder) void {
+        pub fn deinit(self: *Decoder) void {
+            self.mid_block.deinit();
+            for (self.up_blocks) |*block| block.deinit();
             std.heap.page_allocator.free(self.up_blocks);
         }
 
-        pub fn unloadBuffers(self: *zml.Bufferized(Decoder)) void {
+        pub fn unloadBuffers(self: *zml.Bufferized(Decoder), allocator: std.mem.Allocator) void {
             Conv2d.unloadBuffers(&self.conv_in);
-            UNetMidBlock2D.unloadBuffers(&self.mid_block);
-            for (self.up_blocks) |*block| UpDecoderBlock2D.unloadBuffers(block);
+            UNetMidBlock2D.unloadBuffers(&self.mid_block, allocator);
+            for (self.up_blocks) |*block| UpDecoderBlock2D.unloadBuffers(block, allocator);
             GroupNorm.unloadBuffers(&self.conv_norm_out);
             Conv2d.unloadBuffers(&self.conv_out);
+            allocator.free(self.up_blocks);
         }
 
         pub fn forward(self: Decoder, sample: zml.Tensor, latent_embeds: ?zml.Tensor) zml.Tensor {
@@ -517,7 +540,7 @@ pub const Upsample2D = struct {
 
 pub const DownEncoderBlock2D = struct {
     resnets: []ResnetBlock2D,
-    downsamplers: ?[1]Downsample2D,
+    downsamplers: ?[]Downsample2D,
 
     pub fn init(
         store: zml.io.TensorStore.View,
@@ -544,20 +567,32 @@ pub const DownEncoderBlock2D = struct {
             );
         }
 
+        var downsamplers: ?[]Downsample2D = null;
+        if (add_downsample) {
+            const values = try std.heap.page_allocator.alloc(Downsample2D, 1);
+            values[0] = Downsample2D.init(store.withPrefix("downsamplers").withLayer(0), out_channels, out_channels, 0);
+            downsamplers = values;
+        }
+        errdefer if (downsamplers) |values| std.heap.page_allocator.free(values);
+
         return .{
             .resnets = resnets,
-            .downsamplers = if (add_downsample)
-                .{Downsample2D.init(store.withPrefix("downsamplers").withLayer(0), out_channels, out_channels, 0)}
-            else
-                null,
+            .downsamplers = downsamplers,
         };
     }
 
-    pub fn unloadBuffers(self: *zml.Bufferized(DownEncoderBlock2D)) void {
+    pub fn deinit(self: *DownEncoderBlock2D) void {
+        std.heap.page_allocator.free(self.resnets);
+        if (self.downsamplers) |downsamplers| std.heap.page_allocator.free(downsamplers);
+    }
+
+    pub fn unloadBuffers(self: *zml.Bufferized(DownEncoderBlock2D), allocator: std.mem.Allocator) void {
         for (self.resnets) |*resnet| ResnetBlock2D.unloadBuffers(resnet);
-        if (self.downsamplers) |*downsamplers| {
+        if (self.downsamplers) |downsamplers| {
             for (downsamplers) |*downsampler| Downsample2D.unloadBuffers(downsampler);
+            allocator.free(downsamplers);
         }
+        allocator.free(self.resnets);
     }
 
     pub fn forward(self: DownEncoderBlock2D, x: zml.Tensor) zml.Tensor {
@@ -575,7 +610,7 @@ pub const DownEncoderBlock2D = struct {
 
 pub const UpDecoderBlock2D = struct {
     resnets: []ResnetBlock2D,
-    upsamplers: ?[1]Upsample2D,
+    upsamplers: ?[]Upsample2D,
 
     pub fn init(
         store: zml.io.TensorStore.View,
@@ -602,20 +637,32 @@ pub const UpDecoderBlock2D = struct {
             );
         }
 
+        var upsamplers: ?[]Upsample2D = null;
+        if (add_upsample) {
+            const values = try std.heap.page_allocator.alloc(Upsample2D, 1);
+            values[0] = Upsample2D.init(store.withPrefix("upsamplers").withLayer(0), out_channels, out_channels);
+            upsamplers = values;
+        }
+        errdefer if (upsamplers) |values| std.heap.page_allocator.free(values);
+
         return .{
             .resnets = resnets,
-            .upsamplers = if (add_upsample)
-                .{Upsample2D.init(store.withPrefix("upsamplers").withLayer(0), out_channels, out_channels)}
-            else
-                null,
+            .upsamplers = upsamplers,
         };
     }
 
-    pub fn unloadBuffers(self: *zml.Bufferized(UpDecoderBlock2D)) void {
+    pub fn deinit(self: *UpDecoderBlock2D) void {
+        std.heap.page_allocator.free(self.resnets);
+        if (self.upsamplers) |upsamplers| std.heap.page_allocator.free(upsamplers);
+    }
+
+    pub fn unloadBuffers(self: *zml.Bufferized(UpDecoderBlock2D), allocator: std.mem.Allocator) void {
         for (self.resnets) |*resnet| ResnetBlock2D.unloadBuffers(resnet);
-        if (self.upsamplers) |*upsamplers| {
+        if (self.upsamplers) |upsamplers| {
             for (upsamplers) |*upsampler| Upsample2D.unloadBuffers(upsampler);
+            allocator.free(upsamplers);
         }
+        allocator.free(self.resnets);
     }
 
     pub fn forward(self: UpDecoderBlock2D, x: zml.Tensor) zml.Tensor {
@@ -632,7 +679,7 @@ pub const UpDecoderBlock2D = struct {
 };
 
 pub const UNetMidBlock2D = struct {
-    resnets: [2]ResnetBlock2D,
+    resnets: []ResnetBlock2D,
     attention: ?Attention2D,
 
     pub fn init(
@@ -642,11 +689,13 @@ pub const UNetMidBlock2D = struct {
         norm_num_groups: u32,
         add_attention: bool,
     ) !UNetMidBlock2D {
+        const resnets = try std.heap.page_allocator.alloc(ResnetBlock2D, 2);
+        errdefer std.heap.page_allocator.free(resnets);
+        resnets[0] = ResnetBlock2D.init(store.withPrefix("resnets").withLayer(0), in_channels, in_channels, norm_num_groups, act_fn);
+        resnets[1] = ResnetBlock2D.init(store.withPrefix("resnets").withLayer(1), in_channels, in_channels, norm_num_groups, act_fn);
+
         return .{
-            .resnets = .{
-                ResnetBlock2D.init(store.withPrefix("resnets").withLayer(0), in_channels, in_channels, norm_num_groups, act_fn),
-                ResnetBlock2D.init(store.withPrefix("resnets").withLayer(1), in_channels, in_channels, norm_num_groups, act_fn),
-            },
+            .resnets = resnets,
             .attention = if (add_attention)
                 Attention2D.init(store.withPrefix("attentions").withLayer(0), in_channels, @max(@divExact(in_channels, in_channels), 1), in_channels)
             else
@@ -654,9 +703,14 @@ pub const UNetMidBlock2D = struct {
         };
     }
 
-    pub fn unloadBuffers(self: *zml.Bufferized(UNetMidBlock2D)) void {
-        for (&self.resnets) |*resnet| ResnetBlock2D.unloadBuffers(resnet);
+    pub fn deinit(self: *UNetMidBlock2D) void {
+        std.heap.page_allocator.free(self.resnets);
+    }
+
+    pub fn unloadBuffers(self: *zml.Bufferized(UNetMidBlock2D), allocator: std.mem.Allocator) void {
+        for (self.resnets) |*resnet| ResnetBlock2D.unloadBuffers(resnet);
         if (self.attention) |*attn| Attention2D.unloadBuffers(attn);
+        allocator.free(self.resnets);
     }
 
     pub fn forward(self: UNetMidBlock2D, x: zml.Tensor) zml.Tensor {

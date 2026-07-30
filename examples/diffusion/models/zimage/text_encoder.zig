@@ -50,7 +50,7 @@ pub const TextEncoder = struct {
         };
     }
 
-    pub fn deinit(self: TextEncoder, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *TextEncoder, allocator: std.mem.Allocator) void {
         self.inner.deinit(allocator);
     }
 };
@@ -305,7 +305,7 @@ pub const Qwen3RotaryEmbedding = struct {
             .max_seq_len_cached = config.max_position_embeddings,
             .original_max_seq_len = config.max_position_embeddings,
             .rope_opts = .{
-                .layout = .sequential,
+                .layout = .real_im_pass,
                 .scaling = .{ .default = .{ .rope_theta = config.rope_theta } },
             },
             .rotary_dim = config.head_dim,

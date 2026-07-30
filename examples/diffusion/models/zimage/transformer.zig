@@ -40,21 +40,21 @@ pub const Transformer = struct {
     t_scale: f32,
     gradient_checkpointing: bool,
 
-    all_x_embedder: [1]zml.nn.Linear,
-    all_final_layer: [1]FinalLayer,
-    noise_refiner: [NumRefinerLayers]ZImageTransformerBlock,
-    context_refiner: [NumRefinerLayers]ZImageTransformerBlock,
+    all_x_embedder: []zml.nn.Linear,
+    all_final_layer: []FinalLayer,
+    noise_refiner: []ZImageTransformerBlock,
+    context_refiner: []ZImageTransformerBlock,
     t_embedder: TimestepEmbedder,
     cap_embedder: Embedder,
 
     siglip_embedder: ?Embedder,
-    siglip_refiner: ?[NumRefinerLayers]ZImageTransformerBlock,
+    siglip_refiner: ?[]ZImageTransformerBlock,
     siglip_pad_token: ?zml.Tensor,
 
     x_pad_token: zml.Tensor,
     cap_pad_token: zml.Tensor,
 
-    layers: [NumLayers]ZImageTransformerBlock,
+    layers: []ZImageTransformerBlock,
     axes_dims: [3]u32,
     axes_lens: [3]u32,
     rope_embedder: RopeEmbedder,
@@ -81,6 +81,11 @@ pub const Transformer = struct {
         self.axes_lens = config.axes_lens;
         self.rope_embedder = RopeEmbedder.init(config.rope_theta, config.axes_dims, config.axes_lens);
 
+        self.all_x_embedder = try allocator.alloc(zml.nn.Linear, config.all_patch_size.len);
+        errdefer allocator.free(self.all_x_embedder);
+        self.all_final_layer = try allocator.alloc(FinalLayer, config.all_patch_size.len);
+        errdefer allocator.free(self.all_final_layer);
+
         for (config.all_patch_size, config.all_f_patch_size, 0..) |patch_size, f_patch_size, i| {
             var key_buffer: [32]u8 = undefined;
             const key = try std.fmt.bufPrint(&key_buffer, "{d}-{d}", .{ patch_size, f_patch_size });
@@ -106,12 +111,12 @@ pub const Transformer = struct {
             _ = inner_dim;
         }
 
-        _ = allocator;
-
         std.debug.assert(config.n_refiner_layers == NumRefinerLayers);
         std.debug.assert(config.n_layers == NumLayers);
 
-        for (&self.noise_refiner, 0..) |*layer, i| {
+        self.noise_refiner = try allocator.alloc(ZImageTransformerBlock, config.n_refiner_layers);
+        errdefer allocator.free(self.noise_refiner);
+        for (self.noise_refiner, 0..) |*layer, i| {
             layer.* = try ZImageTransformerBlock.init(
                 store.withPrefix("noise_refiner").withLayer(i),
                 1000 + @as(u32, @intCast(i)),
@@ -124,7 +129,9 @@ pub const Transformer = struct {
             );
         }
 
-        for (&self.context_refiner, 0..) |*layer, i| {
+        self.context_refiner = try allocator.alloc(ZImageTransformerBlock, config.n_refiner_layers);
+        errdefer allocator.free(self.context_refiner);
+        for (self.context_refiner, 0..) |*layer, i| {
             layer.* = try ZImageTransformerBlock.init(
                 store.withPrefix("context_refiner").withLayer(i),
                 @intCast(i),
@@ -137,7 +144,9 @@ pub const Transformer = struct {
             );
         }
 
-        for (&self.layers, 0..) |*layer, i| {
+        self.layers = try allocator.alloc(ZImageTransformerBlock, config.n_layers);
+        errdefer allocator.free(self.layers);
+        for (self.layers, 0..) |*layer, i| {
             layer.* = try ZImageTransformerBlock.init(
                 store.withPrefix("layers").withLayer(i),
                 @intCast(i),
@@ -160,8 +169,9 @@ pub const Transformer = struct {
             );
             _ = siglip_feat_dim;
 
-            var refiner: [NumRefinerLayers]ZImageTransformerBlock = undefined;
-            for (&refiner, 0..) |*layer, i| {
+            const refiner = try allocator.alloc(ZImageTransformerBlock, config.n_refiner_layers);
+            errdefer allocator.free(refiner);
+            for (refiner, 0..) |*layer, i| {
                 layer.* = try ZImageTransformerBlock.init(
                     store.withPrefix("siglip_refiner").withLayer(i),
                     2000 + @as(u32, @intCast(i)),
@@ -192,29 +202,40 @@ pub const Transformer = struct {
         });
     }
 
-    pub fn deinit(self: Transformer, allocator: std.mem.Allocator) void {
-        _ = self;
-        _ = allocator;
+    pub fn deinit(self: *Transformer, allocator: std.mem.Allocator) void {
+        allocator.free(self.all_x_embedder);
+        allocator.free(self.all_final_layer);
+        allocator.free(self.noise_refiner);
+        allocator.free(self.context_refiner);
+        if (self.siglip_refiner) |refiner| allocator.free(refiner);
+        allocator.free(self.layers);
     }
 
-    pub fn unloadBuffers(self: *zml.Bufferized(Transformer)) void {
-        for (&self.all_x_embedder) |*embedder| {
+    pub fn unloadBuffers(self: *zml.Bufferized(Transformer), allocator: std.mem.Allocator) void {
+        for (self.all_x_embedder) |*embedder| {
             embedder.weight.deinit();
             if (embedder.bias) |*bias| bias.deinit();
         }
-        for (&self.all_final_layer) |*layer| FinalLayer.unloadBuffers(layer);
-        for (&self.noise_refiner) |*layer| ZImageTransformerBlock.unloadBuffers(layer);
-        for (&self.context_refiner) |*layer| ZImageTransformerBlock.unloadBuffers(layer);
+        for (self.all_final_layer) |*layer| FinalLayer.unloadBuffers(layer);
+        for (self.noise_refiner) |*layer| ZImageTransformerBlock.unloadBuffers(layer);
+        for (self.context_refiner) |*layer| ZImageTransformerBlock.unloadBuffers(layer);
         TimestepEmbedder.unloadBuffers(&self.t_embedder);
         Embedder.unloadBuffers(&self.cap_embedder);
         if (self.siglip_embedder) |*embedder| Embedder.unloadBuffers(embedder);
-        if (self.siglip_refiner) |*layers| {
+        if (self.siglip_refiner) |layers| {
             for (layers) |*layer| ZImageTransformerBlock.unloadBuffers(layer);
         }
         if (self.siglip_pad_token) |*token| token.deinit();
         self.x_pad_token.deinit();
         self.cap_pad_token.deinit();
-        for (&self.layers) |*layer| ZImageTransformerBlock.unloadBuffers(layer);
+        for (self.layers) |*layer| ZImageTransformerBlock.unloadBuffers(layer);
+
+        allocator.free(self.all_x_embedder);
+        allocator.free(self.all_final_layer);
+        allocator.free(self.noise_refiner);
+        allocator.free(self.context_refiner);
+        if (self.siglip_refiner) |refiner| allocator.free(refiner);
+        allocator.free(self.layers);
     }
 
     pub fn forward(
