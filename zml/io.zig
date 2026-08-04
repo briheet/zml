@@ -2,12 +2,12 @@ const std = @import("std");
 
 const pjrt = @import("pjrt");
 const stdx = @import("stdx");
-pub const VFS = @import("io").VFS;
+pub const VFS = @import("vfs");
 
-const Exe = @import("exe.zig").Exe;
 const Buffer = @import("buffer.zig").Buffer;
 const Bufferized = @import("zml.zig").Bufferized;
 const CreateOptions = @import("platform.zig").CreateOptions;
+const Exe = @import("exe.zig").Exe;
 const mem = @import("mem.zig");
 const Memory = @import("platform.zig").Memory;
 const meta = @import("meta.zig");
@@ -373,7 +373,8 @@ pub const Loader = struct {
         };
 
         if (sources.len != 1) {
-            std.debug.panic("Expected loaded tensor to have only 1 source, got {}", .{sources.len});
+            log.debug("Skipping fused tensor with {} sources; expected to be loaded via loadExecute", .{sources.len});
+            return;
         }
 
         self.loadSingleInner(io, sources[0], tensor.shape(), buffer, shardings, opts) catch |e| {

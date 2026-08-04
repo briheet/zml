@@ -148,10 +148,22 @@ pub const Tensor = struct {
     }
 
     pub fn withPartitioning(self: Tensor, axes_: anytype) Tensor {
-        const ctx = CompilationContext.current();
         const partitioned_shape = self._shape.withPartitioning(axes_);
 
-        const attr = ctx.partitioning.tensorShardingAttr(ctx.allocator, ctx.mlir_ctx, partitioned_shape, null) catch unreachable;
+        const ctx = CompilationContext.currentOrNull() orelse {
+            var res = self;
+            res._shape = partitioned_shape;
+            return res;
+        };
+
+        const attr = ctx.partitioning.tensorShardingAttr(ctx.allocator, ctx.mlir_ctx, partitioned_shape, null) catch |err| switch (err) {
+            error.NoSuitableSharding => std.debug.panic(
+                "{f}.withPartitioning({f}) failed to resolve because it's using unknown sharding. Pass more shardings to `zml.compile`. Known shardings: {f}",
+                .{ self, partitioned_shape, stdx.fmt.slice(ctx.partitioning.shardings) },
+            ),
+            error.OutOfMemory, error.WriteFailed => @panic("OOM"),
+            error.MissingDeviceInTile => @panic("TODO"),
+        };
 
         const op_result = switch (ctx.partitioning.partitioner) {
             .shardy => blk: {
@@ -186,6 +198,7 @@ pub const Tensor = struct {
         return _result(partitioned_shape, op_result);
     }
 
+    /// Copy the given tensor to the specified memory.
     pub fn toMemory(self: Tensor, kind: Memory.Kind) Tensor {
         const ctx = CompilationContext.current();
         switch (ctx.platform.target) {
@@ -221,6 +234,26 @@ pub const Tensor = struct {
         return res;
     }
 
+    /// Copy all the given tensor to the specified memory.
+    /// The input struct is copied on the stack, so it must be a simple flat struct without pointers.
+    pub fn toMemoryAll(flat_tensors: anytype, kind: Memory.Kind) @TypeOf(flat_tensors) {
+        const ctx = CompilationContext.current();
+        switch (ctx.platform.target) {
+            .cpu, .neuron, .metal => return flat_tensors,
+            .cuda, .rocm, .tpu, .oneapi => {},
+        }
+
+        var copy = flat_tensors;
+        meta.visitFlatStruct(struct {
+            fn onMemory(k: Memory.Kind, x: *Tensor) void {
+                x.* = x.toMemory(k);
+            }
+        }.onMemory, kind, &copy);
+        return copy;
+    }
+
+    /// Mark the given input tensor as being physically located on a specific memory.
+    /// Has no effect if the input tensor is not an executable input.
     pub fn onMemory(self: Tensor, kind: Memory.Kind) Tensor {
         const ctx = CompilationContext.current();
         switch (ctx.platform.target) {
@@ -235,6 +268,23 @@ pub const Tensor = struct {
         ctx.currentScope().id_to_input_memory_kind.put(ctx.currentScope().arena.allocator(), self.id, kind) catch unreachable;
 
         return self;
+    }
+
+    /// Mark all the given input tensors as being physically located on a specific memory
+    /// see `zml.Tensor.onMemory`
+    pub fn onMemoryAll(tensors: anytype, kind: Memory.Kind) void {
+        const ctx = CompilationContext.current();
+        switch (ctx.platform.target) {
+            // Only one memory kind on those platform
+            .cpu, .neuron, .metal => return,
+            .cuda, .rocm, .tpu, .oneapi => {},
+        }
+
+        meta.visit(struct {
+            fn onMemory(k: Memory.Kind, x: *const Tensor) void {
+                _ = x.onMemory(k);
+            }
+        }.onMemory, kind, &tensors);
     }
 
     /// Returns a Tensor with new tag names.
@@ -1233,21 +1283,52 @@ pub const Tensor = struct {
     /// Axes with the same tag on both sides, and which aren't contracting,
     /// are considered "batching axes".
     pub fn dot(lhs: Tensor, rhs: Tensor, args: anytype) Tensor {
-        stdx.debug.assert(lhs.shape().hasTag(args) != null, "Expected lhs to have {any} tag, got {f}", .{ args, lhs.shape() });
-        stdx.debug.assert(rhs.shape().hasTag(args) != null, "Expected rhs to have {any} tag, got {f}", .{ args, rhs.shape() });
+        const dot_axes = lhs.dotAxes(rhs, args);
+        return lhs.dotGeneral(rhs, dot_axes.contracting.constSlice(), dot_axes.batching.constSlice());
+    }
 
-        const lhs_contracting_dim: i8 = @intCast(lhs.shape().hasTag(args).?);
-        const rhs_contracting_dim: i8 = @intCast(rhs.shape().hasTag(args).?);
+    pub const DotAxes = struct {
+        contracting: stdx.BoundedArray([2]i8, constants.MAX_RANK),
+        batching: stdx.BoundedArray([2]i8, constants.MAX_RANK),
+    };
+
+    /// Returns contracting and batching axis pairs inferred from one or more tags.
+    pub fn dotAxes(lhs: Tensor, rhs: Tensor, tags: anytype) DotAxes {
+        const T = @TypeOf(tags);
+        if (comptime T == Shape.Tag or T == @EnumLiteral()) {
+            return lhs.dotAxes(rhs, .{tags});
+        }
+
+        const lhs_contracting_axes, _ = lhs.shape().parseAxes(tags);
+        const rhs_contracting_axes, _ = rhs.shape().parseAxes(tags);
+        var contracting_axes: stdx.BoundedArray([2]i8, constants.MAX_RANK) = .empty;
+        for (lhs_contracting_axes.constSlice(), rhs_contracting_axes.constSlice()) |l, r| {
+            contracting_axes.appendAssumeCapacity(.{ @intCast(l), @intCast(r) });
+        }
 
         var batching_axes: stdx.BoundedArray([2]i8, constants.MAX_RANK) = .empty;
         for (0..lhs.rank()) |lhs_tag_index| {
+            if (std.mem.indexOfScalar(u3, lhs_contracting_axes.constSlice(), @intCast(lhs_tag_index)) != null) {
+                continue;
+            }
+
             const lhs_tag = lhs.shape().tag(lhs_tag_index);
-            if (lhs_tag == Shape.toTag(args)) continue;
             if (rhs.shape().hasTag(lhs_tag)) |rhs_tag_index| {
                 batching_axes.appendAssumeCapacity(.{ @intCast(lhs_tag_index), @intCast(rhs_tag_index) });
             }
         }
-        return lhs.dotGeneral(rhs, &.{.{ lhs_contracting_dim, rhs_contracting_dim }}, batching_axes.slice());
+
+        return .{ .contracting = contracting_axes, .batching = batching_axes };
+    }
+
+    test dotAxes {
+        const lhs: Tensor = .init(.{ .a = 20, .b = 21, .c = 22 }, .f32);
+        const rhs: Tensor = .init(.{ .c = 22, .b = 21, .d = 23, .a = 20 }, .f32);
+
+        const dot_axes = lhs.dotAxes(rhs, .{ .c, .a });
+
+        try std.testing.expectEqualSlices([2]i8, &.{ .{ 2, 0 }, .{ 0, 3 } }, dot_axes.contracting.constSlice());
+        try std.testing.expectEqualSlices([2]i8, &.{.{ 1, 1 }}, dot_axes.batching.constSlice());
     }
 
     test dot {
@@ -4388,11 +4469,14 @@ pub const Tensor = struct {
     /// Only for debug purpose, it inserts device to host synchronization
     /// so it will slow down the program execution.
     pub fn print(input: Tensor, name: []const u8) void {
-        switch (CompilationContext.current().platform.target) {
+        const ctx = CompilationContext.current();
+        const full_name = std.fmt.allocPrint(ctx.arena.allocator(), "{s}: {f}", .{ name, input.shape() }) catch @panic("OOM");
+        defer ctx.arena.allocator().free(full_name);
+        switch (ctx.platform.target) {
             .cpu, .cuda, .rocm, .tpu, .metal => {
-                ops.manualComputation(input, {}, .{ .name = name }, (struct {
-                    fn body(ctx_: anytype, _: std.mem.Allocator, sharded_input: Tensor, _: void) void {
-                        ops.customCall("zml$print", sharded_input, {}, .{ .name = ctx_.name }, .{ .has_side_effect = true });
+                ops.manualComputation(input, {}, full_name, (struct {
+                    fn body(_full_name: []const u8, _: std.mem.Allocator, sharded_input: Tensor, _: void) void {
+                        ops.customCall("zml$print", sharded_input, {}, .{ .name = _full_name }, .{ .has_side_effect = true });
                     }
                 }).body);
             },
